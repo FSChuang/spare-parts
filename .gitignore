@@ -1,0 +1,22 @@
+# ---- Build output ----
+build/
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+
+# ---- Windows ----
+Thumbs.db
+Desktop.ini
+
+# ---- Linux ----
+*~
+.directory
+
+# ---- IDEs / editors ----
+.vs/
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
