@@ -18,12 +18,14 @@ add_executable(main
 # a real persistent network client, not optional).
 target_link_libraries(main PRIVATE Engine EngineNetwork Threads::Threads)
 
-# The headless multiplayer server (Milestone 2 Section 2). Deliberately links only
-# EngineNetwork — no Engine, so no SDL3 — since it owns no window/renderer/entities.
+# The headless multiplayer server (Milestone 2 Section 2, dedicated-session topology
+# added in Section 4 checkpoint 2). Deliberately links only EngineNetwork — no Engine,
+# so no SDL3 — since it owns no window/renderer/entities. Now spawns one std::thread per
+# dedicated client session, hence Threads::Threads.
 add_executable(server
     src/server_main.cpp
 )
-target_link_libraries(server PRIVATE EngineNetwork)
+target_link_libraries(server PRIVATE EngineNetwork Threads::Threads)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't
@@ -33,3 +35,12 @@ add_executable(NetworkClientIntegrationTest
     src/NetworkClientIntegrationTest.cpp
 )
 target_link_libraries(NetworkClientIntegrationTest PRIVATE EngineNetwork Threads::Threads)
+
+# Lightweight, non-SDL test tooling for Milestone 2 Section 4 checkpoint 2's real
+# bootstrap + dedicated-session server topology (see SessionTestClient.cpp for exact
+# usage). This is NOT the real NetworkClient — that migration to JoinAccepted-driven
+# handoff is the next checkpoint.
+add_executable(SessionTestClient
+    src/SessionTestClient.cpp
+)
+target_link_libraries(SessionTestClient PRIVATE EngineNetwork)
