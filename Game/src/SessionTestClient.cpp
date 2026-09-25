@@ -8,12 +8,13 @@
 // Usage:
 //   SessionTestClient join
 //       Bootstrap JOIN against tcp://127.0.0.1:5556.
-//       Prints "JOINED <id> <port>" or "ERROR <code>".
+//       Prints "JOINED <id> <sessionPort> <p2pPort>" or "ERROR <code>".
 //   SessionTestClient update <port> <id> <posX> <posY> <velX> <velY>
 //       Dedicated-session StateUpdate (Leaving=false) against tcp://127.0.0.1:<port>.
-//       Prints "SNAPSHOT <recipientId> <rosterCount> <id> <x> <y> <vx> <vy> ..." or
-//       "ERROR <code>". Passing a <id> other than the one this port was assigned is how
-//       the PlayerId-spoofing scenario is exercised.
+//       Prints "SNAPSHOT <recipientId> <rosterCount> <id> <x> <y> <vx> <vy> ... PEERS
+//       <peerCount> <peerId> <p2pPort> ..." or "ERROR <code>". Passing a <id> other
+//       than the one this port was assigned is how the PlayerId-spoofing scenario is
+//       exercised.
 //   SessionTestClient leave <port> <id>
 //       Dedicated-session StateUpdate (Leaving=true). Same reply format as `update`.
 //   SessionTestClient sendjoin <port>
@@ -58,6 +59,14 @@ namespace
 			std::printf(" %u %f %f %f %f", state.Id, state.PositionX, state.PositionY, state.VelocityX,
 			            state.VelocityY);
 		}
+		// Milestone 2 Section 5 server checkpoint: the peer directory, printed
+		// separately from Roster since the two are independent, unordered lists (no
+		// index correlation) — tests must look up a peer by Id, never by position here.
+		std::printf(" PEERS %zu", snapshot.Peers.size());
+		for (const Engine::PeerInfo& peer : snapshot.Peers)
+		{
+			std::printf(" %u %u", peer.Id, peer.P2pPort);
+		}
 		std::printf("\n");
 	}
 
@@ -73,7 +82,7 @@ namespace
 				std::fprintf(stderr, "SessionTestClient: malformed JOIN_ACCEPTED reply\n");
 				return 1;
 			}
-			std::printf("JOINED %u %u\n", accepted->AssignedId, accepted->AssignedPort);
+			std::printf("JOINED %u %u %u\n", accepted->AssignedId, accepted->AssignedPort, accepted->P2pPort);
 			return 0;
 		}
 
