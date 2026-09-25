@@ -19,13 +19,25 @@ add_executable(main
 target_link_libraries(main PRIVATE Engine EngineNetwork Threads::Threads)
 
 # The headless multiplayer server (Milestone 2 Section 2, dedicated-session topology
-# added in Section 4 checkpoint 2). Deliberately links only EngineNetwork — no Engine,
-# so no SDL3 — since it owns no window/renderer/entities. Now spawns one std::thread per
-# dedicated client session, hence Threads::Threads.
+# added in Section 4 checkpoint 2, server-authoritative moving platform added in
+# Section 4's final checkpoint). Deliberately links only EngineNetwork — no Engine, so
+# no SDL3 — since it owns no window/renderer/entities; ServerPlatform.cpp only needs
+# <chrono>/<cmath> and Engine::PlatformState (already part of EngineNetwork's Protocol),
+# not SDL. Spawns one std::thread per dedicated client session, hence Threads::Threads.
 add_executable(server
     src/server_main.cpp
+    src/ServerPlatform.cpp
 )
 target_link_libraries(server PRIVATE EngineNetwork Threads::Threads)
+
+# Deterministic unit test for ComputePlatformState (see ServerPlatformTest.cpp) — pure
+# function of two explicit time points, needs no running server and no real elapsed
+# time. Links only EngineNetwork, same as `server` itself.
+add_executable(ServerPlatformTest
+    src/ServerPlatform.cpp
+    src/ServerPlatformTest.cpp
+)
+target_link_libraries(ServerPlatformTest PRIVATE EngineNetwork)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't
@@ -54,3 +66,15 @@ add_executable(SessionTestClient
     src/SessionTestClient.cpp
 )
 target_link_libraries(SessionTestClient PRIVATE EngineNetwork)
+
+# Real, non-SDL-window integration test for Milestone 2 Section 4's final checkpoint:
+# Timeline-scaled message rate and cross-client platform consistency (see
+# NetworkRateAndPlatformTest.cpp). Needs Engine (for Engine::Timeline, which brings in
+# SDL3 transitively — this test calls a minimal SDL_Init(0)/SDL_Quit(), no window).
+# Requires a real running production server; not CTest-registered, same rationale as
+# the other Game/src/*IntegrationTest.cpp files.
+add_executable(NetworkRateAndPlatformTest
+    src/NetworkClient.cpp
+    src/NetworkRateAndPlatformTest.cpp
+)
+target_link_libraries(NetworkRateAndPlatformTest PRIVATE Engine EngineNetwork Threads::Threads)

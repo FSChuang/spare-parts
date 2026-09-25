@@ -8,9 +8,13 @@
 // stalled/blocked client structurally unable to affect any other client or new JOINs —
 // each session thread's blocking Receive() is entirely its own.
 //
-// PlatformState remains the checkpoint-1 neutral placeholder {0,0,0,0} — no server-time
-// platform simulation yet (that is a later checkpoint, Design 1: pure function of
-// std::chrono::steady_clock, no platform thread/mutex).
+// PlatformState (Milestone 2 Section 4 final checkpoint): every successful Snapshot now
+// carries the real, server-authoritative moving platform, computed by the pure,
+// stateless ComputePlatformState() (see ServerPlatform.h/.cpp) from `serverStartTime`
+// (established once here, in main(), before the bootstrap loop starts) and the current
+// real time. No platform thread, no platform mutex, no mutable shared platform state —
+// every session thread computes the same trajectory independently, and it never depends
+// on any client's Timeline.
 //
 // KNOWN LIMITATION (accepted for this checkpoint): if a client vanishes without ever
 // sending Leaving=true, its session thread stays blocked in Receive() forever, and its
@@ -21,8 +25,11 @@
 #include "Engine/Network/ServerDispatch.h"
 #include "Engine/Network/Socket.h"
 
+#include "ServerPlatform.h"
+
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <future>
 #include <memory>
@@ -66,6 +73,36 @@ namespace
 		g_PortInUse[index] = false;
 	}
 
+	// Overwrites a Snapshot reply's Platform field with the real, current
+	// server-authoritative value. Engine::HandleSessionRequest deliberately knows
+	// nothing about real time or spare-parts world constants (CLAUDE.md: the engine/game
+	// boundary is sacred) — it always encodes a neutral placeholder, so this is the
+	// smallest possible spare-parts-side fix-up: decode, overwrite one field, re-encode.
+	// Error replies carry no Platform field at all, so they pass through unchanged.
+	std::vector<std::uint8_t> InjectCurrentPlatformState(const std::vector<std::uint8_t>& replyBytes,
+	                                                       std::chrono::steady_clock::time_point serverStartTime)
+	{
+		if (Engine::PeekMessageType(replyBytes) != Engine::MessageType::Snapshot)
+		{
+			return replyBytes;
+		}
+
+		std::optional<Engine::Snapshot> snapshot = Engine::DecodeSnapshot(replyBytes);
+		if (!snapshot.has_value())
+		{
+			// Defensive only: HandleSessionRequest's own Snapshot encoding is always
+			// well-formed, so this branch is not expected to be reachable.
+			return replyBytes;
+		}
+
+		snapshot->Platform = ComputePlatformState(serverStartTime, std::chrono::steady_clock::now());
+
+		// The roster that produced `replyBytes` already fit within MaxPlayers (it came
+		// from HandleSessionRequest's own successful encode), and only the Platform
+		// field changed, so this re-encode cannot newly exceed that bound.
+		return *Engine::EncodeSnapshot(*snapshot);
+	}
+
 	// Bootstrap/control-side owner of one dedicated session's resources. Bootstrap owns
 	// every SessionRecord for the server's entire lifetime; a session thread may only
 	// update `Finished` (via the shared_ptr, so it survives independently of this
@@ -87,7 +124,8 @@ namespace
 	// until it observes a genuine, correctly-identified Leaving=true.
 	void SessionMain(std::uint16_t port, Engine::PlayerId playerId, Engine::PlayerRegistry& registry,
 	                  std::mutex& registryMutex, std::promise<bool> readyPromise,
-	                  std::shared_ptr<std::atomic<bool>> finished)
+	                  std::shared_ptr<std::atomic<bool>> finished,
+	                  std::chrono::steady_clock::time_point serverStartTime)
 	{
 		std::string endpoint = "tcp://*:" + std::to_string(port);
 		std::optional<Engine::Socket> socket;
@@ -124,6 +162,11 @@ namespace
 				replyBytes = Engine::HandleSessionRequest(registry, playerId, requestBytes);
 			}
 			// Registry lock released before Send() — never held across ZeroMQ I/O.
+
+			// Platform injection needs no lock: it only reads local `replyBytes` and the
+			// immutable `serverStartTime`, and samples steady_clock — no shared mutable
+			// state at all.
+			replyBytes = InjectCurrentPlatformState(replyBytes, serverStartTime);
 
 			socket->Send(ToFrame(replyBytes));
 
@@ -166,6 +209,12 @@ namespace
 int main(int argc, char* argv[])
 {
 	std::string bootstrapEndpoint = (argc > 1) ? argv[1] : DefaultBootstrapEndpoint;
+
+	// Established once, before the bootstrap loop starts; every dedicated session
+	// thread derives the server-authoritative platform's position from this same,
+	// immutable value — no mutex needed for it, since it is never modified after this
+	// line (Milestone 2 Section 4 final checkpoint).
+	const auto serverStartTime = std::chrono::steady_clock::now();
 
 	Engine::Socket bootstrap(Engine::SocketRole::Reply);
 	bootstrap.Bind(bootstrapEndpoint);
@@ -222,7 +271,7 @@ int main(int argc, char* argv[])
 		std::shared_ptr<std::atomic<bool>> finished = std::make_shared<std::atomic<bool>>(false);
 
 		std::thread worker(SessionMain, *port, *playerId, std::ref(registry), std::ref(registryMutex),
-		                    std::move(readyPromise), finished);
+		                    std::move(readyPromise), finished, serverStartTime);
 
 		// Blocks until the session reports bind success/failure — no registry lock
 		// held here, and no arbitrary sleep: this is the deterministic readiness

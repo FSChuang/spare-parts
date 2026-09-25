@@ -87,6 +87,11 @@ std::optional<Engine::Snapshot> NetworkClient::GetLatestSnapshot() const
 	return m_LatestSnapshot;
 }
 
+std::uint64_t NetworkClient::GetSentStateUpdateCount() const
+{
+	return m_SentStateUpdateCount.load(std::memory_order_relaxed);
+}
+
 void NetworkClient::WorkerMain(std::string endpoint)
 {
 	Engine::PlayerId assignedId = 0;
@@ -180,6 +185,10 @@ void NetworkClient::WorkerMain(std::string endpoint)
 
 			socket.Send(ToFrame(Engine::EncodeStateUpdate(Engine::StateUpdate{ *stateToSend, false })));
 			std::vector<std::uint8_t> replyBytes = ToBytes(socket.Receive());
+
+			// Counted only once this full request/reply round trip has actually
+			// completed — real wire traffic, not merely a PublishState() call.
+			m_SentStateUpdateCount.fetch_add(1, std::memory_order_relaxed);
 
 			std::optional<Engine::Snapshot> snapshot = Engine::DecodeSnapshot(replyBytes);
 			if (snapshot.has_value())

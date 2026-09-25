@@ -2,7 +2,9 @@
 
 #include "Engine/Network/Protocol.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -68,6 +70,16 @@ public:
 	// remote-player update (add/update/remove by PlayerId) is idempotent.
 	std::optional<Engine::Snapshot> GetLatestSnapshot() const;
 
+	// TEST/DEBUG INSTRUMENTATION ONLY (Milestone 2 Section 4 final checkpoint): counts
+	// how many StateUpdate request/reply round trips this client's worker has actually
+	// completed on its dedicated socket — i.e. real wire traffic, not merely how many
+	// times PublishState() was called (a burst of PublishState calls between two
+	// network tics collapses to at most one real send). Used only to mechanically
+	// verify the Timeline-scaled message-rate scheduler in NetworkRateAndPlatformTest;
+	// not part of the gameplay-facing design. Lock-free: written only by the worker
+	// thread, read only by the main thread.
+	std::uint64_t GetSentStateUpdateCount() const;
+
 private:
 	// Runs entirely on the worker thread: connects a temporary bootstrap Socket,
 	// performs JOIN, decodes JoinAccepted, and destroys that socket; then connects a
@@ -88,6 +100,11 @@ private:
 	std::optional<Engine::Snapshot> m_LatestSnapshot;
 	Engine::PlayerId m_LocalPlayerId = 0;
 	bool m_Connected = false;
+
+	// Test/debug instrumentation (see GetSentStateUpdateCount()). Independent of
+	// m_IncomingMutex on purpose: a single monotonically-increasing counter needs no
+	// mutex when only one thread ever writes it.
+	std::atomic<std::uint64_t> m_SentStateUpdateCount{ 0 };
 
 	// Constructed last so it starts only once every member above it is fully
 	// initialized (WorkerMain reads/writes them from the moment it starts running).
