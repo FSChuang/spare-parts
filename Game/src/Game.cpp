@@ -145,14 +145,19 @@ void Game::UpdateNetworking()
 	Engine::Vector2 velocity = m_Player.GetVelocity();
 	Engine::PlayerState localState{ m_Network.GetLocalPlayerId(), position.X, position.Y, velocity.X, velocity.Y };
 
-	// Synchronous, blocking exchange (documented limitation, NetworkClient.h): if it
-	// fails, keep showing the last known remote roster rather than clearing everyone.
-	if (!m_Network.SendState(localState))
+	// Non-blocking (Milestone 2 Section 3): PublishState never touches the network,
+	// it only replaces the latest not-yet-sent state for the worker thread to pick up.
+	m_Network.PublishState(localState);
+
+	// If nothing has arrived yet (still connecting, or the last exchange errored),
+	// keep showing the last known remote roster rather than clearing everyone.
+	std::optional<Engine::Snapshot> snapshot = m_Network.GetLatestSnapshot();
+	if (!snapshot.has_value())
 	{
 		return;
 	}
 
-	const std::vector<Engine::PlayerState>& roster = m_Network.GetLatestRoster();
+	const std::vector<Engine::PlayerState>& roster = snapshot->Roster;
 
 	std::unordered_map<Engine::PlayerId, Engine::PlayerState> latestRemoteStates;
 	for (const Engine::PlayerState& state : roster)

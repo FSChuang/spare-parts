@@ -1,23 +1,33 @@
 #pragma once
 
 #include "Engine/Network/Protocol.h"
-#include "Engine/Network/Socket.h"
 
+#include <condition_variable>
+#include <mutex>
+#include <optional>
 #include <string>
-#include <vector>
+#include <thread>
 
-// Game-facing networking glue for Milestone 2 Section 2 (Spare Parts-specific, not a
-// generic Engine abstraction). Owns one persistent ZeroMQ REQ connection to the
-// headless server, joins once at construction, and lets Game exchange its local
-// player's state for the server's latest roster snapshot once per frame.
+// Game-facing networking glue for Milestone 2 Sections 2-3 (Spare Parts-specific, not a
+// generic Engine abstraction). Owns a background worker thread that exclusively
+// creates, uses, and destroys the ZeroMQ Socket for its entire lifetime — the
+// main/game thread never touches ZeroMQ directly and never blocks on network I/O.
+// (Engine::Socket is only ever named inside NetworkClient.cpp's worker function, not
+// in this header, precisely because the main thread has no business holding one.)
 //
-// IMPORTANT: every exchange here (the initial JOIN and every later SendState()) is a
-// blocking, synchronous REQ/REP round trip on the calling (main/render) thread. If no
-// server is reachable, construction will block indefinitely on the JOIN reply. This is
-// an accepted, documented limitation for Section 2 only — Section 3 introduces the
-// threading needed to stop networking from blocking the game loop. Do not add a
-// receive timeout, retry logic, or a worker thread here; that is out of scope for
-// this step.
+// Main-thread API — every method here is non-blocking:
+//   PublishState()       replaces the latest not-yet-sent local state; no network I/O.
+//   GetLatestSnapshot()  returns the latest known roster, if any; no network I/O.
+//   IsConnected() / GetLocalPlayerId()  race-free reads of worker-published state.
+//
+// KNOWN LIMITATION (accepted for Milestone 2 Section 3): if the worker thread is
+// already blocked inside a Socket::Receive() call (either the initial JOIN or a later
+// steady-state exchange) when the server stops responding, the destructor's
+// std::thread::join() will wait for however long that Receive() takes to return — or
+// forever, if the server never replies again. No receive timeout, reconnect, heartbeat,
+// or socket cancellation is implemented to bound this; that is explicitly out of scope
+// here (Section 4 territory). Shutdown completes promptly whenever the server remains
+// healthy and responsive, which is the case this step is required to get right.
 class NetworkClient
 {
 public:
@@ -27,35 +37,45 @@ public:
 	NetworkClient(const NetworkClient&) = delete;
 	NetworkClient& operator=(const NetworkClient&) = delete;
 
-	// True once JOIN has succeeded and an ID was assigned. False if the server
-	// replied with an error (e.g. registry full) or a malformed/unrecognized reply.
+	// True once the worker thread's JOIN has succeeded and an ID was assigned. False
+	// if JOIN failed (error/malformed reply) or hasn't completed yet. Race-free: both
+	// this and GetLocalPlayerId() read state the worker publishes under m_IncomingMutex.
 	bool IsConnected() const;
-
 	Engine::PlayerId GetLocalPlayerId() const;
 
-	// Sends the local player's current state (its Id field is overwritten with the
-	// assigned local player ID, so the caller cannot report under the wrong ID) and
-	// blocks for the server's reply. Returns false if not connected or the exchange
-	// failed (error/malformed reply); the previously stored roster is left unchanged
-	// in that case so the game keeps rendering the last known state rather than
-	// clearing everyone.
-	bool SendState(const Engine::PlayerState& localState);
+	// Replaces the latest not-yet-sent local state (a single slot, not a queue) and
+	// wakes the worker thread. Safe to call every frame from the main thread; never
+	// performs network I/O. If the game produces frames faster than the network thread
+	// can exchange them, older unsent states are simply overwritten and never sent —
+	// intentional, since only the most current state matters here.
+	void PublishState(const Engine::PlayerState& state);
 
-	// The latest roster received from the server, including the local player's own
-	// entry. Game is responsible for excluding its own ID when building remote
-	// players (see Game::UpdateNetworking).
-	const std::vector<Engine::PlayerState>& GetLatestRoster() const;
-
-	// Reports Leaving=true so the server removes this player immediately, rather
-	// than waiting on any future disconnect/timeout detection (Section 2 has none).
-	// Idempotent: a no-op if not connected or already disconnected. Called
-	// automatically by the destructor, so RAII covers every normal exit path;
-	// exposed publicly only in case Game needs an earlier, explicit shutdown point.
-	void Disconnect();
+	// The latest roster the worker thread has received, if any exchange has completed
+	// yet. Never blocks on network I/O. Deliberately not cleared after reading —
+	// re-applying an unchanged Snapshot on repeated frames is harmless, since Game's
+	// remote-player update (add/update/remove by PlayerId) is idempotent.
+	std::optional<Engine::Snapshot> GetLatestSnapshot() const;
 
 private:
-	Engine::Socket m_Socket;
-	bool m_Connected;
-	Engine::PlayerId m_LocalPlayerId;
-	std::vector<Engine::PlayerState> m_LatestRoster;
+	// Runs entirely on the worker thread: creates its own Socket, connects, performs
+	// JOIN, then loops sending the latest published state and publishing whatever
+	// Snapshot comes back, until told to stop — at which point it reports
+	// Leaving=true before returning (which destroys the Socket, on this same thread).
+	void WorkerMain(std::string endpoint);
+
+	// --- outgoing: written by the main thread, consumed by the worker thread ---
+	mutable std::mutex m_OutgoingMutex;
+	std::condition_variable m_OutgoingCondition;
+	std::optional<Engine::PlayerState> m_PendingOutgoingState;
+	bool m_StopRequested = false;
+
+	// --- incoming: written by the worker thread, read by the main thread ---
+	mutable std::mutex m_IncomingMutex;
+	std::optional<Engine::Snapshot> m_LatestSnapshot;
+	Engine::PlayerId m_LocalPlayerId = 0;
+	bool m_Connected = false;
+
+	// Constructed last so it starts only once every member above it is fully
+	// initialized (WorkerMain reads/writes them from the moment it starts running).
+	std::thread m_Worker;
 };
