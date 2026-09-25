@@ -8,7 +8,9 @@
 
 #include <SDL3/SDL_scancode.h>
 
+#include <chrono>
 #include <cmath>
+#include <unordered_set>
 
 namespace
 {
@@ -53,7 +55,12 @@ Game::Game(const std::string& serverEndpoint)
 	  m_Enemy({ EnemyPatrolLeftBound, EnemyPatrolY }, EnemySize, EnemyColor),
 	  m_Physics(Gravity),
 	  m_EnemyPatrolDirection(1.0f),
-	  m_Network(serverEndpoint)
+	  m_Network(serverEndpoint),
+	  // Set in the past by exactly one interval, so the very first Update() call
+	  // triggers an immediate server refresh rather than waiting a full interval
+	  // first — steady_clock's own epoch is unspecified, so this is computed relative
+	  // to "now" rather than assumed to already be far enough in the past.
+	  m_LastServerRefreshTime(std::chrono::steady_clock::now() - ServerRefreshInterval)
 {
 }
 
@@ -176,39 +183,62 @@ void Game::RespawnPlayer()
 
 void Game::UpdateNetworking(float deltaTime)
 {
-	// Milestone 2 Section 4 final checkpoint: publish is throttled to a logical network
-	// tic rate (NetworkUpdateIntervalSeconds at Timeline scale 1x), not once per render
-	// frame. deltaTime here is already Timeline-scaled (Application computes it from
-	// Timeline::GetDeltaTime()), so this single accumulator is what makes 0.5x/1x/2x
-	// scale directly halve/double the real-world outbound message rate. While paused,
-	// Timeline reports deltaTime == 0, so the accumulator simply never advances and
-	// sends naturally stop — no separate pause check is needed here.
-	//
-	// If deltaTime crosses more than one interval in a single frame (a large 2x-scaled
-	// frame, or a frame after a long stall), only the single newest PlayerState is
-	// published — never a burst of historical ones — and std::fmod collapses the
-	// accumulator back into range while preserving the fractional remainder, exactly
-	// mirroring how PublishState's own single-slot mailbox already discards anything
-	// but the latest value.
+	// Milestone 2 Section 5 final integration: PeerClient can only be constructed once
+	// NetworkClient's asynchronous bootstrap handshake has actually completed — its
+	// PlayerId and P2P port are not known synchronously at Game construction time.
+	// Created exactly once; never destroyed/recreated while this Game instance lives.
+	// Constructing only starts PeerClient's worker thread; it never waits for peer
+	// traffic, so this never blocks Game/main thread.
+	if (!m_PeerClient && m_Network.IsConnected())
+	{
+		Engine::PlayerId localId = m_Network.GetLocalPlayerId();
+		std::uint16_t localP2pPort = m_Network.GetLocalP2pPort();
+		if (localId != 0 && localP2pPort != 0)
+		{
+			m_PeerClient = std::make_unique<PeerClient>(localId, localP2pPort);
+		}
+	}
+
+	Engine::Vector2 position = m_Player.GetPosition();
+	Engine::Vector2 velocity = m_Player.GetVelocity();
+	Engine::PlayerState localState{ m_Network.GetLocalPlayerId(), position.X, position.Y, velocity.X, velocity.Y };
+
+	// P2P gameplay publish: Timeline-scaled, exactly as Section 4 established
+	// (0.5x/1x/2x -> ~15/30/60 Hz), now redirected to PeerClient instead of the server.
+	// deltaTime here is already Timeline-scaled (Application computes it from
+	// Timeline::GetDeltaTime()), so this accumulator is what makes Timeline scale
+	// directly halve/double the real-world P2P publish rate. While paused, Timeline
+	// reports deltaTime == 0, so the accumulator simply never advances and P2P sends
+	// naturally stop — no separate pause check needed. If deltaTime crosses more than
+	// one interval in a single frame, only the single newest state is published — never
+	// a burst — and std::fmod collapses the accumulator while preserving the
+	// fractional remainder.
 	m_NetworkUpdateAccumulator += deltaTime;
 	if (m_NetworkUpdateAccumulator >= NetworkUpdateIntervalSeconds)
 	{
 		m_NetworkUpdateAccumulator = std::fmod(m_NetworkUpdateAccumulator, NetworkUpdateIntervalSeconds);
+		if (m_PeerClient)
+		{
+			m_PeerClient->PublishState(localState);
+		}
+	}
 
-		Engine::Vector2 position = m_Player.GetPosition();
-		Engine::Vector2 velocity = m_Player.GetVelocity();
-		Engine::PlayerState localState{ m_Network.GetLocalPlayerId(), position.X, position.Y, velocity.X,
-			                             velocity.Y };
-
-		// Non-blocking (Milestone 2 Section 3): PublishState never touches the
-		// network, it only replaces the latest not-yet-sent state for the worker
-		// thread to pick up.
+	// Server-facing session refresh: fixed real-time cadence, deliberately independent
+	// of both Timeline scale AND pause — a paused player should still keep its server
+	// membership/peer-directory/platform freshness current. This is what keeps
+	// Snapshot.Roster/Peers/Platform arriving even while the P2P accumulator above is
+	// frozen at deltaTime == 0. The PlayerState sent here is advisory/membership data
+	// only from this point on — nothing below ever reads it back for remote rendering.
+	auto now = std::chrono::steady_clock::now();
+	if (now - m_LastServerRefreshTime >= ServerRefreshInterval)
+	{
+		m_LastServerRefreshTime = now;
 		m_Network.PublishState(localState);
 	}
 
-	// Snapshot application (remote roster AND the shared platform) must remain
-	// available every frame regardless of the publish throttle above — remote
-	// rendering is never held back to the local send rate. If nothing has arrived yet
+	// Snapshot application (shared platform, membership, peer directory) must remain
+	// available every frame regardless of either publish schedule above — remote
+	// rendering is never held back to either send rate. If nothing has arrived yet
 	// (still connecting, JOIN no longer carries an initial roster, or the last exchange
 	// errored), keep showing the last known state rather than clearing/hiding anything.
 	std::optional<Engine::Snapshot> snapshot = m_Network.GetLatestSnapshot();
@@ -223,22 +253,35 @@ void Game::UpdateNetworking(float deltaTime)
 	m_Platform.SetPosition({ snapshot->Platform.PositionX, snapshot->Platform.PositionY });
 	m_Platform.SetVelocity({ snapshot->Platform.VelocityX, snapshot->Platform.VelocityY });
 
-	const std::vector<Engine::PlayerState>& roster = snapshot->Roster;
-
-	std::unordered_map<Engine::PlayerId, Engine::PlayerState> latestRemoteStates;
-	for (const Engine::PlayerState& state : roster)
+	// Peer directory: hand the server's current PlayerId -> P2P port mapping straight
+	// to PeerClient. PeerClient already filters out the local player's own id; Game
+	// never assumes anything about vector order here.
+	if (m_PeerClient)
 	{
-		if (state.Id != m_Network.GetLocalPlayerId())
+		m_PeerClient->UpdatePeers(snapshot->Peers);
+	}
+
+	// Roster is membership ONLY, as of this final integration: it decides WHICH remote
+	// PlayerIds are allowed to exist, never WHERE they are. No PlayerState field from
+	// Roster is read below except Id — remote transform comes exclusively from
+	// PeerClient::GetLatestPeerStates() further down.
+	Engine::PlayerId localId = m_Network.GetLocalPlayerId();
+	std::unordered_set<Engine::PlayerId> activeRemoteIds;
+	for (const Engine::PlayerState& state : snapshot->Roster)
+	{
+		if (state.Id != localId)
 		{
-			latestRemoteStates[state.Id] = state;
+			activeRemoteIds.insert(state.Id);
 		}
 	}
 
-	// A PlayerId absent from this snapshot has disconnected (or hasn't joined) —
+	// A PlayerId absent from server membership has disconnected (or hasn't joined) —
 	// remove its entity so late-join and clean-disconnect are both naturally reflected.
+	// Server membership has authority over EXISTENCE even if PeerClient still happens to
+	// hold a stale last-known state for it.
 	for (auto it = m_RemotePlayers.begin(); it != m_RemotePlayers.end();)
 	{
-		if (latestRemoteStates.find(it->first) == latestRemoteStates.end())
+		if (activeRemoteIds.find(it->first) == activeRemoteIds.end())
 		{
 			it = m_RemotePlayers.erase(it);
 		}
@@ -248,11 +291,24 @@ void Game::UpdateNetworking(float deltaTime)
 		}
 	}
 
-	for (const auto& entry : latestRemoteStates)
+	if (!m_PeerClient)
 	{
-		Engine::PlayerId id = entry.first;
-		const Engine::PlayerState& state = entry.second;
+		return;
+	}
 
+	std::unordered_map<Engine::PlayerId, Engine::PlayerState> latestPeerStates = m_PeerClient->GetLatestPeerStates();
+	for (Engine::PlayerId id : activeRemoteIds)
+	{
+		auto peerStateIt = latestPeerStates.find(id);
+		if (peerStateIt == latestPeerStates.end())
+		{
+			// A currently-active member with no P2P state yet (its PUB/SUB
+			// subscription may not have finished establishing) simply has no entity
+			// yet — never created from server data as a placeholder.
+			continue;
+		}
+
+		const Engine::PlayerState& state = peerStateIt->second;
 		auto existingRemotePlayer = m_RemotePlayers.find(id);
 		if (existingRemotePlayer == m_RemotePlayers.end())
 		{

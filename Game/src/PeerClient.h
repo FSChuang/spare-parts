@@ -2,7 +2,9 @@
 
 #include "Engine/Network/Protocol.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -59,6 +61,14 @@ public:
 	// never appears here. MaxPlayers <= 8, so copying the whole map is cheap.
 	std::unordered_map<Engine::PlayerId, Engine::PlayerState> GetLatestPeerStates() const;
 
+	// TEST/DEBUG INSTRUMENTATION ONLY (Milestone 2 Section 5 final integration): counts
+	// how many PUB messages this client's worker has actually sent — real wire traffic,
+	// not merely how many times PublishState() was called. Used only to mechanically
+	// verify the Timeline-scaled P2P publish rate; not part of the gameplay-facing
+	// design. Lock-free: written only by the worker thread, read only by the main
+	// thread — mirrors NetworkClient::GetSentStateUpdateCount().
+	std::uint64_t GetSentStateUpdateCount() const;
+
 private:
 	// Runs entirely on the worker thread: binds a Publish socket to `localP2pPort`,
 	// creates a Subscribe socket (subscribed to everything), then loops reconciling the
@@ -77,6 +87,9 @@ private:
 	// --- incoming: written by the worker thread, read by the main thread ---
 	mutable std::mutex m_IncomingMutex;
 	std::unordered_map<Engine::PlayerId, Engine::PlayerState> m_LatestPeerStates;
+
+	// Test/debug instrumentation (see GetSentStateUpdateCount()).
+	std::atomic<std::uint64_t> m_SentStateUpdateCount{ 0 };
 
 	// Constructed last so it starts only once every member above it is fully
 	// initialized (WorkerMain reads/writes them from the moment it starts running).

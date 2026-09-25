@@ -28,7 +28,14 @@
 // Main-thread API — every method here is non-blocking:
 //   PublishState()       replaces the latest not-yet-sent local state; no network I/O.
 //   GetLatestSnapshot()  returns the latest known roster, if any; no network I/O.
-//   IsConnected() / GetLocalPlayerId()  race-free reads of worker-published state.
+//   IsConnected() / GetLocalPlayerId() / GetLocalP2pPort()  race-free reads of
+//     worker-published state.
+//
+// Milestone 2 Section 5 final integration: Snapshot.Roster is membership/presence
+// data ONLY as far as this class's callers are concerned — remote player position and
+// velocity now come exclusively from a separate PeerClient (peer-to-peer), which Game
+// owns and feeds using GetLocalPlayerId()/GetLocalP2pPort() once connected. This class
+// itself is unaware of PeerClient; it only carries the P2P port JoinAccepted assigned.
 //
 // GetLatestSnapshot() may briefly return std::nullopt even once IsConnected() is true:
 // JOIN itself no longer carries a roster (JoinAccepted has none), so the first real
@@ -56,6 +63,13 @@ public:
 	// this and GetLocalPlayerId() read state the worker publishes under m_IncomingMutex.
 	bool IsConnected() const;
 	Engine::PlayerId GetLocalPlayerId() const;
+
+	// The port this client's server-assigned peer-to-peer PUB socket should bind to
+	// (Milestone 2 Section 5), valid under the same conditions as GetLocalPlayerId():
+	// zero until connected, race-free under the same m_IncomingMutex. NetworkClient
+	// never creates a P2P socket itself — this is purely a pass-through of what
+	// JoinAccepted carried, for Game to hand to a PeerClient it owns.
+	std::uint16_t GetLocalP2pPort() const;
 
 	// Replaces the latest not-yet-sent local state (a single slot, not a queue) and
 	// wakes the worker thread. Safe to call every frame from the main thread; never
@@ -99,6 +113,7 @@ private:
 	mutable std::mutex m_IncomingMutex;
 	std::optional<Engine::Snapshot> m_LatestSnapshot;
 	Engine::PlayerId m_LocalPlayerId = 0;
+	std::uint16_t m_LocalP2pPort = 0;
 	bool m_Connected = false;
 
 	// Test/debug instrumentation (see GetSentStateUpdateCount()). Independent of

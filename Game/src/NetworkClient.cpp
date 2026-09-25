@@ -72,6 +72,12 @@ Engine::PlayerId NetworkClient::GetLocalPlayerId() const
 	return m_LocalPlayerId;
 }
 
+std::uint16_t NetworkClient::GetLocalP2pPort() const
+{
+	std::lock_guard<std::mutex> lock(m_IncomingMutex);
+	return m_LocalP2pPort;
+}
+
 void NetworkClient::PublishState(const Engine::PlayerState& state)
 {
 	{
@@ -95,6 +101,7 @@ std::uint64_t NetworkClient::GetSentStateUpdateCount() const
 void NetworkClient::WorkerMain(std::string endpoint)
 {
 	Engine::PlayerId assignedId = 0;
+	std::uint16_t assignedP2pPort = 0;
 	std::optional<std::string> dedicatedEndpoint;
 
 	{
@@ -135,6 +142,7 @@ void NetworkClient::WorkerMain(std::string endpoint)
 		}
 
 		assignedId = accepted->AssignedId;
+		assignedP2pPort = accepted->P2pPort;
 	}
 	// `bootstrapSocket` was destroyed at the close of the scope above — gone before the
 	// dedicated gameplay socket below is ever created.
@@ -155,6 +163,7 @@ void NetworkClient::WorkerMain(std::string endpoint)
 	{
 		std::lock_guard<std::mutex> lock(m_IncomingMutex);
 		m_LocalPlayerId = assignedId;
+		m_LocalP2pPort = assignedP2pPort;
 		m_Connected = true;
 	}
 

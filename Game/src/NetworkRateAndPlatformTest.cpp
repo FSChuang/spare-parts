@@ -1,15 +1,18 @@
-// Real, non-SDL-window integration test for Milestone 2 Section 4's final checkpoint:
-// Timeline-scaled message rate AND server-authoritative platform consistency. Requires
-// a real running production server at BootstrapEndpoint. Not CTest-registered — same
-// rationale as the other Game/src/*IntegrationTest.cpp files (a real multi-second/timing
-// scenario, not a pure deterministic unit; ServerPlatformTest.cpp covers the pure,
-// deterministic half of the platform work separately).
+// Real, non-SDL-window integration test for Milestone 2 Section 5's final integration:
+// Timeline-scaled P2P message rate, fixed-real-time server-refresh rate, and
+// server-authoritative platform consistency/continuity (including while a client is
+// paused). Requires a real running production server at BootstrapEndpoint. Not
+// CTest-registered — same rationale as the other Game/src/*IntegrationTest.cpp files (a
+// real multi-second/timing scenario, not a pure deterministic unit; ServerPlatformTest.cpp
+// covers the pure, deterministic half of the platform work separately).
 //
-// This drives three real NetworkClient instances, each paced by its own
-// Engine::Timeline at a different scale (0.5x/1x/2x), reproducing exactly the same
-// accumulator scheme Game::UpdateNetworking uses (see NetworkRate.h for the shared
-// constant). This harness has no SDL window/Renderer, so it cannot reuse Game itself —
-// it reimplements that one small scheme directly, the same way
+// This drives four real NetworkClient instances, each paced by its own Engine::Timeline
+// (0.5x/1x/2x/paused), plus one real PeerClient per client once connected — reproducing
+// exactly the same dual-schedule scheme Game::UpdateNetworking uses (see NetworkRate.h
+// for the shared constants): a Timeline-scaled accumulator feeding PeerClient, and an
+// independent fixed-real-time (~150ms) refresh feeding NetworkClient, regardless of
+// Timeline scale or pause. This harness has no SDL window/Renderer, so it cannot reuse
+// Game itself — it reimplements that one small scheme directly, the same way
 // NetworkClientIntegrationTest/MultiClientIntegrationTest already reimplement small
 // pieces of Game's networking glue rather than dragging in SDL.
 //
@@ -19,6 +22,7 @@
 
 #include "NetworkClient.h"
 #include "NetworkRate.h"
+#include "PeerClient.h"
 
 #include "Engine/Network/Protocol.h"
 #include "Engine/Time/Timeline.h"
@@ -29,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -36,8 +41,13 @@
 namespace
 {
 	constexpr const char* BootstrapEndpoint = "tcp://127.0.0.1:5556";
-	constexpr int ClientCount = 3;
-	constexpr std::array<double, ClientCount> TimelineScales{ 0.5, 1.0, 2.0 };
+	// Clients 0/1/2 measure the Timeline-scaled P2P rate at 0.5x/1x/2x; client 3 is
+	// permanently paused for its entire run, to prove the paused case (P2P ~0,
+	// server-refresh unaffected, platform still fresh) without disturbing the other
+	// three clients' own rate measurements.
+	constexpr int ClientCount = 4;
+	constexpr int PausedClientIndex = 3;
+	constexpr std::array<double, ClientCount> TimelineScales{ 0.5, 1.0, 2.0, 1.0 };
 	// Required observation window is >= 5 real seconds; a small margin absorbs the
 	// connect/poll time already spent before the window starts.
 	constexpr double ObservationSeconds = 5.5;
@@ -109,7 +119,7 @@ int main()
 			    return true;
 		    },
 		    PollTimeoutMs, PollIntervalMs);
-		Check(allConnected, "AllThreeClients_BecomeConnectedWithinTimeout");
+		Check(allConnected, "AllFourClients_BecomeConnectedWithinTimeout");
 
 		std::array<Engine::PlayerId, ClientCount> ids{};
 		for (int i = 0; i < ClientCount; ++i)
@@ -117,18 +127,25 @@ int main()
 			ids[i] = clients[i]->GetLocalPlayerId();
 		}
 
-		// One independent Timeline per client, each fixed at its own scale for the
-		// whole observation window — exactly modeling three players who each pressed a
-		// different Timeline-scale key before this window began.
+		// One independent Timeline per client, fixed at its own scale for the whole
+		// observation window — exactly modeling players who each pressed a different
+		// Timeline-scale (or pause) key before this window began.
 		std::array<Engine::Timeline, ClientCount> timelines;
 		for (int i = 0; i < ClientCount; ++i)
 		{
 			timelines[i].SetScale(TimelineScales[i]);
 		}
+		timelines[PausedClientIndex].Pause();
 
-		std::array<float, ClientCount> accumulators{};
+		std::array<float, ClientCount> p2pAccumulators{};
+		std::array<std::chrono::steady_clock::time_point, ClientCount> lastServerRefresh{};
+		std::array<std::unique_ptr<PeerClient>, ClientCount> peerClients{};
 
 		auto observationStart = std::chrono::steady_clock::now();
+		for (int i = 0; i < ClientCount; ++i)
+		{
+			lastServerRefresh[i] = observationStart - ServerRefreshInterval;
+		}
 		std::uint64_t loopIterations = 0;
 
 		while (std::chrono::duration<double>(std::chrono::steady_clock::now() - observationStart).count() <
@@ -137,27 +154,69 @@ int main()
 			++loopIterations;
 			for (int i = 0; i < ClientCount; ++i)
 			{
-				// Exactly Game::UpdateNetworking's scheme: accumulate Timeline-scaled
-				// deltaTime, publish at most once per interval crossed, collapse any
-				// extra crossed intervals via fmod rather than bursting.
-				float deltaTime = static_cast<float>(timelines[i].GetDeltaTime());
-				accumulators[i] += deltaTime;
-				if (accumulators[i] >= NetworkUpdateIntervalSeconds)
+				// Lazily create PeerClient once connected+id+port are known — exactly
+				// mirroring Game::UpdateNetworking's own creation condition.
+				if (!peerClients[i])
 				{
-					accumulators[i] = std::fmod(accumulators[i], NetworkUpdateIntervalSeconds);
+					std::uint16_t p2pPort = clients[i]->GetLocalP2pPort();
+					if (ids[i] != 0 && p2pPort != 0)
+					{
+						peerClients[i] = std::make_unique<PeerClient>(ids[i], p2pPort);
+					}
+				}
+
+				// P2P gameplay publish: Timeline-scaled, exactly Game::UpdateNetworking's
+				// scheme, redirected to PeerClient. For the paused client, GetDeltaTime()
+				// always reports 0, so this accumulator never advances and never publishes
+				// — proving the paused case without any special-case code here either.
+				float deltaTime = static_cast<float>(timelines[i].GetDeltaTime());
+				p2pAccumulators[i] += deltaTime;
+				if (p2pAccumulators[i] >= NetworkUpdateIntervalSeconds)
+				{
+					p2pAccumulators[i] = std::fmod(p2pAccumulators[i], NetworkUpdateIntervalSeconds);
+					if (peerClients[i])
+					{
+						peerClients[i]->PublishState(Engine::PlayerState{ ids[i], 0.0f, 0.0f, 0.0f, 0.0f });
+					}
+				}
+
+				// Server-facing session refresh: fixed real-time cadence, independent of
+				// Timeline scale/pause — continues identically for the paused client.
+				auto now = std::chrono::steady_clock::now();
+				if (now - lastServerRefresh[i] >= ServerRefreshInterval)
+				{
+					lastServerRefresh[i] = now;
 					clients[i]->PublishState(Engine::PlayerState{ ids[i], 0.0f, 0.0f, 0.0f, 0.0f });
+				}
+
+				// Keep each PeerClient's peer directory current, mirroring
+				// Game::UpdateNetworking, though this test only measures send rates/
+				// platform freshness, not P2P delivery (see PeerClientIntegrationTest.cpp
+				// and P2pIntegrationTest.cpp for delivery proofs).
+				if (peerClients[i])
+				{
+					std::optional<Engine::Snapshot> snapshot = clients[i]->GetLatestSnapshot();
+					if (snapshot.has_value())
+					{
+						peerClients[i]->UpdatePeers(snapshot->Peers);
+					}
 				}
 			}
 		}
 
-		double actualDuration = std::chrono::duration<double>(std::chrono::steady_clock::now() - observationStart).count();
+		double actualDuration =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - observationStart).count();
 
-		std::array<std::uint64_t, ClientCount> counts{};
-		std::array<double, ClientCount> rates{};
+		std::array<std::uint64_t, ClientCount> p2pCounts{};
+		std::array<double, ClientCount> p2pRates{};
+		std::array<std::uint64_t, ClientCount> serverCounts{};
+		std::array<double, ClientCount> serverRates{};
 		for (int i = 0; i < ClientCount; ++i)
 		{
-			counts[i] = clients[i]->GetSentStateUpdateCount();
-			rates[i] = static_cast<double>(counts[i]) / actualDuration;
+			p2pCounts[i] = peerClients[i] ? peerClients[i]->GetSentStateUpdateCount() : 0;
+			p2pRates[i] = static_cast<double>(p2pCounts[i]) / actualDuration;
+			serverCounts[i] = clients[i]->GetSentStateUpdateCount();
+			serverRates[i] = static_cast<double>(serverCounts[i]) / actualDuration;
 		}
 
 		std::printf("\n--- Rate test results ---\n");
@@ -167,19 +226,22 @@ int main()
 		            static_cast<unsigned long long>(loopIterations), loopRate);
 		for (int i = 0; i < ClientCount; ++i)
 		{
-			std::printf("Client %d (scale=%.1fx): %llu StateUpdates sent -> %.2f Hz\n", i, TimelineScales[i],
-			            static_cast<unsigned long long>(counts[i]), rates[i]);
+			const char* label = (i == PausedClientIndex) ? "paused" : "active";
+			std::printf("Client %d (scale=%.1fx, %s): P2P %llu sent -> %.2f Hz | server %llu sent -> %.2f Hz\n", i,
+			            TimelineScales[i], label, static_cast<unsigned long long>(p2pCounts[i]), p2pRates[i],
+			            static_cast<unsigned long long>(serverCounts[i]), serverRates[i]);
 		}
-		if (rates[0] > 0.0)
+		if (p2pRates[0] > 0.0)
 		{
-			std::printf("Ratio 0.5x : 1x : 2x = 1.00 : %.2f : %.2f\n", rates[1] / rates[0], rates[2] / rates[0]);
+			std::printf("P2P ratio 0.5x : 1x : 2x = 1.00 : %.2f : %.2f\n", p2pRates[1] / p2pRates[0],
+			            p2pRates[2] / p2pRates[0]);
 		}
 
 		// Generous tolerance for scheduler/frame/network jitter — the assignment does
 		// not require exact counts, only that scaling roughly doubles/halves the rate.
-		Check(rates[1] > rates[0] * 1.5 && rates[1] < rates[0] * 2.5, "OneX_Rate_RoughlyDoubleHalfXRate");
-		Check(rates[2] > rates[1] * 1.5 && rates[2] < rates[1] * 2.5, "TwoX_Rate_RoughlyDoubleOneXRate");
-		Check(rates[2] >= 50.0, "TwoX_Rate_MeetsApproximately60HzTarget");
+		Check(p2pRates[1] > p2pRates[0] * 1.5 && p2pRates[1] < p2pRates[0] * 2.5, "OneX_P2pRate_RoughlyDoubleHalfXRate");
+		Check(p2pRates[2] > p2pRates[1] * 1.5 && p2pRates[2] < p2pRates[1] * 2.5, "TwoX_P2pRate_RoughlyDoubleOneXRate");
+		Check(p2pRates[2] >= 50.0, "TwoX_P2pRate_MeetsApproximately60HzTarget");
 
 		// IMPORTANT 2X AUDIT: is this harness's own loop even capable of offering 60
 		// publish opportunities per second? If not, a low 2x rate would be a scheduling
@@ -195,13 +257,36 @@ int main()
 			    "not just network-limited. This does not reflect the real SDL game loop's own frame rate.\n");
 		}
 
-		// --- Cross-client platform consistency, across three DIFFERENTLY-scaled clients ---
+		// Server-facing refresh rate must stay approximately constant (~6.67 Hz) across
+		// ALL four clients regardless of Timeline scale or pause — it is deliberately
+		// decoupled from Timeline entirely.
+		bool serverRatesConsistent = true;
+		for (int i = 0; i < ClientCount; ++i)
+		{
+			if (serverRates[i] < 4.0 || serverRates[i] > 10.0)
+			{
+				serverRatesConsistent = false;
+			}
+		}
+		Check(serverRatesConsistent, "ServerRefreshRate_ApproximatelySixPointSixSevenHzForAllClients");
+
+		// The paused client's P2P accumulator never advances (GetDeltaTime() reports 0
+		// while paused), so its P2P send count must be exactly zero, while its
+		// server-facing refresh rate is unaffected.
+		Check(p2pCounts[PausedClientIndex] == 0, "PausedClient_P2pRate_IsExactlyZero");
+		Check(serverRates[PausedClientIndex] >= 4.0 && serverRates[PausedClientIndex] <= 10.0,
+		      "PausedClient_ServerRefreshRate_ContinuesUnaffected");
+
+		// --- Cross-client platform consistency, across differently-scaled (and one
+		// paused) clients ---
 		// One more publish+capture round per client, each bracketed by a local
-		// wall-clock timestamp, to check that all three observe the SAME server-time
-		// platform trajectory despite having run at 0.5x/1x/2x Timeline scale for the
-		// entire window above. This is also the proof that the server platform's path
-		// never depended on any client's own Timeline: if it had, three differently
-		// Timeline-scaled clients could not agree on one shared trajectory here.
+		// wall-clock timestamp, to check that all four observe the SAME server-time
+		// platform trajectory despite having run at 0.5x/1x/2x/paused Timeline state for
+		// the entire window above. This is also the proof that the server platform's
+		// path never depended on any client's own Timeline: if it had, four differently
+		// Timeline-scaled/paused clients could not agree on one shared trajectory here —
+		// and, per Milestone 2 Section 5, the paused client observing a FRESH platform at
+		// all is itself the proof that server refresh no longer depends on Timeline.
 		std::array<std::optional<PlatformObservation>, ClientCount> observations;
 		for (int i = 0; i < ClientCount; ++i)
 		{
@@ -216,14 +301,18 @@ int main()
 			}
 		}
 
-		bool allObserved = observations[0].has_value() && observations[1].has_value() && observations[2].has_value();
-		Check(allObserved, "AllThreeClients_ObservedAPlatformSnapshot");
+		bool allObserved = observations[0].has_value() && observations[1].has_value() &&
+		                    observations[2].has_value() && observations[3].has_value();
+		Check(allObserved, "AllFourClients_ObservedAPlatformSnapshot");
+		Check(observations[PausedClientIndex].has_value(),
+		      "PausedClient_StillReceivesFreshPlatformSnapshot_ImportantSection5Improvement");
 
 		if (allObserved)
 		{
 			bool sameY = observations[0]->Platform.PositionY == observations[1]->Platform.PositionY &&
-			             observations[1]->Platform.PositionY == observations[2]->Platform.PositionY;
-			Check(sameY, "PlatformY_IdenticalAcrossAllThreeClients");
+			             observations[1]->Platform.PositionY == observations[2]->Platform.PositionY &&
+			             observations[2]->Platform.PositionY == observations[3]->Platform.PositionY;
+			Check(sameY, "PlatformY_IdenticalAcrossAllFourClients");
 
 			bool consistent = true;
 			for (int a = 0; a < ClientCount; ++a)
@@ -249,9 +338,14 @@ int main()
 					}
 				}
 			}
-			Check(consistent, "PlatformPositions_ConsistentWithOneSharedServerTimeTrajectory_AcrossDifferentScales");
+			Check(consistent,
+			      "PlatformPositions_ConsistentWithOneSharedServerTimeTrajectory_AcrossDifferentScalesAndPause");
 		}
 
+		for (std::unique_ptr<PeerClient>& peerClient : peerClients)
+		{
+			peerClient.reset();
+		}
 		for (std::optional<NetworkClient>& client : clients)
 		{
 			client.reset();

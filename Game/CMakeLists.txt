@@ -10,6 +10,7 @@ find_package(Threads REQUIRED)
 add_executable(main
     src/Game.cpp
     src/NetworkClient.cpp
+    src/PeerClient.cpp
     src/main.cpp
 )
 
@@ -75,6 +76,7 @@ target_link_libraries(SessionTestClient PRIVATE EngineNetwork)
 # the other Game/src/*IntegrationTest.cpp files.
 add_executable(NetworkRateAndPlatformTest
     src/NetworkClient.cpp
+    src/PeerClient.cpp
     src/NetworkRateAndPlatformTest.cpp
 )
 target_link_libraries(NetworkRateAndPlatformTest PRIVATE Engine EngineNetwork Threads::Threads)
@@ -90,3 +92,14 @@ add_executable(PeerClientIntegrationTest
     src/PeerClientIntegrationTest.cpp
 )
 target_link_libraries(PeerClientIntegrationTest PRIVATE EngineNetwork Threads::Threads)
+
+# Real, non-SDL integration test for Milestone 2 Section 5's final integration: the
+# server-Roster/P2P directness proof and the required real multi-client scenario (see
+# P2pIntegrationTest.cpp). Requires a real running production server; not
+# CTest-registered, same rationale as the other Game/src/*IntegrationTest.cpp files.
+add_executable(P2pIntegrationTest
+    src/NetworkClient.cpp
+    src/PeerClient.cpp
+    src/P2pIntegrationTest.cpp
+)
+target_link_libraries(P2pIntegrationTest PRIVATE EngineNetwork Threads::Threads)

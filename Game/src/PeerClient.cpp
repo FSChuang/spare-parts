@@ -79,6 +79,11 @@ std::unordered_map<Engine::PlayerId, Engine::PlayerState> PeerClient::GetLatestP
 	return m_LatestPeerStates;
 }
 
+std::uint64_t PeerClient::GetSentStateUpdateCount() const
+{
+	return m_SentStateUpdateCount.load(std::memory_order_relaxed);
+}
+
 void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP2pPort, std::string host)
 {
 	// Created, used, and (on return) destroyed entirely on this thread — neither
@@ -183,6 +188,7 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 			stateToSend->Id = localPlayerId;
 			lastSentState = stateToSend;
 			pub.Send(ToFrame(Engine::EncodeStateUpdate(Engine::StateUpdate{ *stateToSend, false })));
+			m_SentStateUpdateCount.fetch_add(1, std::memory_order_relaxed);
 		}
 
 		// Drain every currently-available peer message — TryReceive() never blocks, so
