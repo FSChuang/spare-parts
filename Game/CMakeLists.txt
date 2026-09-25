@@ -78,3 +78,15 @@ add_executable(NetworkRateAndPlatformTest
     src/NetworkRateAndPlatformTest.cpp
 )
 target_link_libraries(NetworkRateAndPlatformTest PRIVATE Engine EngineNetwork Threads::Threads)
+
+# Real, non-SDL integration test for PeerClient (Milestone 2 Section 5 PeerClient
+# checkpoint — see PeerClientIntegrationTest.cpp). Needs no running production server:
+# PeerClient is pure peer-to-peer, proven here purely between real PeerClient instances
+# over real ZeroMQ PUB/SUB. Not CTest-registered, same rationale as the other
+# Game/src/*IntegrationTest.cpp files. PeerClient is NOT yet linked into `main` —
+# this checkpoint proves it independently, before any Game integration.
+add_executable(PeerClientIntegrationTest
+    src/PeerClient.cpp
+    src/PeerClientIntegrationTest.cpp
+)
+target_link_libraries(PeerClientIntegrationTest PRIVATE EngineNetwork Threads::Threads)
