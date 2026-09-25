@@ -2,6 +2,8 @@
 
 #include "Engine/Network/Socket.h"
 
+#include <optional>
+
 namespace
 {
 	std::vector<std::uint8_t> ToBytes(const std::string& frame)
@@ -13,13 +15,32 @@ namespace
 	{
 		return std::string(bytes.begin(), bytes.end());
 	}
+
+	// Smallest possible "<scheme>://<host>:<port>" rewrite — not a general URI parser.
+	// Keeps everything up to and including the final ':' delimiter and replaces only the
+	// port itself, so "tcp://127.0.0.1:5556" + 5558 -> "tcp://127.0.0.1:5558" and
+	// "tcp://localhost:5556" + 5560 -> "tcp://localhost:5560" (the LAST ':' is always the
+	// one separating host from port; an earlier one, e.g. in "tcp://", is never it).
+	// Returns std::nullopt for input with no ':' at all, or a ':' with nothing after it —
+	// not a shape this can safely rewrite.
+	std::optional<std::string> BuildDedicatedEndpoint(const std::string& bootstrapEndpoint, std::uint16_t port)
+	{
+		std::size_t lastColon = bootstrapEndpoint.find_last_of(':');
+		if (lastColon == std::string::npos || lastColon + 1 >= bootstrapEndpoint.size())
+		{
+			return std::nullopt;
+		}
+
+		return bootstrapEndpoint.substr(0, lastColon + 1) + std::to_string(port);
+	}
 }
 
 NetworkClient::NetworkClient(const std::string& serverEndpoint)
 	: m_Worker(&NetworkClient::WorkerMain, this, serverEndpoint)
 {
-	// Returns immediately: WorkerMain performs Connect()/JOIN on its own thread, not
-	// here, so construction never blocks the caller on network I/O.
+	// Returns immediately: WorkerMain performs the entire bootstrap+dedicated-session
+	// handshake on its own thread, not here, so construction never blocks the caller on
+	// network I/O.
 }
 
 NetworkClient::~NetworkClient()
@@ -30,9 +51,9 @@ NetworkClient::~NetworkClient()
 	}
 	m_OutgoingCondition.notify_one();
 
-	// The main thread never touches the Socket directly — it only signals the worker
-	// and waits for it to finish on its own terms (see WorkerMain's shutdown handling
-	// and the KNOWN LIMITATION documented in NetworkClient.h).
+	// The main thread never touches a Socket directly — it only signals the worker and
+	// waits for it to finish on its own terms (see WorkerMain's shutdown handling and the
+	// KNOWN LIMITATION documented in NetworkClient.h).
 	if (m_Worker.joinable())
 	{
 		m_Worker.join();
@@ -68,47 +89,74 @@ std::optional<Engine::Snapshot> NetworkClient::GetLatestSnapshot() const
 
 void NetworkClient::WorkerMain(std::string endpoint)
 {
-	// Created, used, and (on return) destroyed entirely on this thread — the Socket
-	// is never named outside this function, so the main thread has no way to touch it.
+	Engine::PlayerId assignedId = 0;
+	std::optional<std::string> dedicatedEndpoint;
+
+	{
+		// Bootstrap phase: this Socket lives only inside this nested scope, so it is
+		// guaranteed destroyed — connection closed — before any dedicated-session
+		// gameplay traffic begins (Milestone 2 Section 4: bootstrap accepts JOIN only,
+		// dedicated sessions accept StateUpdate only, and the two must never share a
+		// socket).
+		Engine::Socket bootstrapSocket(Engine::SocketRole::Request);
+		bootstrapSocket.Connect(endpoint);
+
+		bootstrapSocket.Send(ToFrame(Engine::EncodeJoinRequest()));
+		std::vector<std::uint8_t> joinReplyBytes = ToBytes(bootstrapSocket.Receive());
+
+		std::optional<Engine::JoinAccepted> accepted;
+		if (Engine::PeekMessageType(joinReplyBytes) == Engine::MessageType::JoinAccepted)
+		{
+			accepted = Engine::DecodeJoinAccepted(joinReplyBytes);
+		}
+
+		if (!accepted.has_value())
+		{
+			// Error, or something malformed/unrecognized: publish disconnected and stop.
+			// There is nothing to retry (no reconnect logic here). JOIN no longer
+			// replies with a Snapshot now that dedicated sessions exist, so that is not
+			// accepted here either.
+			std::lock_guard<std::mutex> lock(m_IncomingMutex);
+			m_Connected = false;
+			return;
+		}
+
+		dedicatedEndpoint = BuildDedicatedEndpoint(endpoint, accepted->AssignedPort);
+		if (!dedicatedEndpoint.has_value())
+		{
+			std::lock_guard<std::mutex> lock(m_IncomingMutex);
+			m_Connected = false;
+			return;
+		}
+
+		assignedId = accepted->AssignedId;
+	}
+	// `bootstrapSocket` was destroyed at the close of the scope above — gone before the
+	// dedicated gameplay socket below is ever created.
+
 	Engine::Socket socket(Engine::SocketRole::Request);
-	socket.Connect(endpoint);
-
-	socket.Send(ToFrame(Engine::EncodeJoinRequest()));
-	std::vector<std::uint8_t> joinReplyBytes = ToBytes(socket.Receive());
-
-	std::optional<Engine::Snapshot> joinSnapshot;
-	if (Engine::PeekMessageType(joinReplyBytes) == Engine::MessageType::Snapshot)
-	{
-		joinSnapshot = Engine::DecodeSnapshot(joinReplyBytes);
-	}
-
-	if (!joinSnapshot.has_value())
-	{
-		// Server replied with an error, or something malformed/unrecognized: publish
-		// disconnected and stop. There is nothing to retry (no reconnect logic here).
-		std::lock_guard<std::mutex> lock(m_IncomingMutex);
-		m_Connected = false;
-		return;
-	}
+	socket.Connect(*dedicatedEndpoint);
 
 	// This thread's own copy of the assigned ID, used only for this thread's own
 	// subsequent logic (stamping outgoing states, building the final Leaving message).
 	// Never read cross-thread; GetLocalPlayerId() reads the separate, mutex-published
 	// m_LocalPlayerId member instead, so there is no ambiguity about which access needs
 	// the lock.
-	Engine::PlayerId assignedId = joinSnapshot->RecipientId;
+	//
+	// Connected is only ever set true here, once both the bootstrap handoff and the
+	// dedicated connection have fully succeeded. There is deliberately no roster
+	// Snapshot yet at this point — JOIN now only returns JoinAccepted; the first
+	// regular StateUpdate below receives the first real Snapshot.
+	{
+		std::lock_guard<std::mutex> lock(m_IncomingMutex);
+		m_LocalPlayerId = assignedId;
+		m_Connected = true;
+	}
 
 	// The most recent state this thread has actually sent, kept purely locally so a
 	// clean shutdown can report Leaving=true without ever asking the main thread for
 	// m_Player (Game/Entity stay entirely main-thread-only, per design).
 	std::optional<Engine::PlayerState> lastSentState;
-
-	{
-		std::lock_guard<std::mutex> lock(m_IncomingMutex);
-		m_LocalPlayerId = assignedId;
-		m_LatestSnapshot = joinSnapshot;
-		m_Connected = true;
-	}
 
 	bool stopRequested = false;
 	while (!stopRequested)
@@ -143,8 +191,9 @@ void NetworkClient::WorkerMain(std::string endpoint)
 		}
 	}
 
-	// Final, best-effort clean-leave exchange. If no normal state was ever published
-	// before shutdown, fall back to a neutral state under the assigned ID.
+	// Final, best-effort clean-leave exchange on the dedicated socket (the bootstrap
+	// socket is long gone by now). If no normal state was ever published before
+	// shutdown, fall back to a neutral state under the assigned ID.
 	Engine::PlayerState leavingState =
 	    lastSentState.value_or(Engine::PlayerState{ assignedId, 0.0f, 0.0f, 0.0f, 0.0f });
 	leavingState.Id = assignedId;

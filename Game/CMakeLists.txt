@@ -36,6 +36,16 @@ add_executable(NetworkClientIntegrationTest
 )
 target_link_libraries(NetworkClientIntegrationTest PRIVATE EngineNetwork Threads::Threads)
 
+# Real, non-SDL 3-client integration test proving Section 4's dedicated-session
+# isolation from the real NetworkClient's side (see MultiClientIntegrationTest.cpp).
+# Requires a real running production server; not CTest-registered, same rationale as
+# NetworkClientIntegrationTest.
+add_executable(MultiClientIntegrationTest
+    src/NetworkClient.cpp
+    src/MultiClientIntegrationTest.cpp
+)
+target_link_libraries(MultiClientIntegrationTest PRIVATE EngineNetwork Threads::Threads)
+
 # Lightweight, non-SDL test tooling for Milestone 2 Section 4 checkpoint 2's real
 # bootstrap + dedicated-session server topology (see SessionTestClient.cpp for exact
 # usage). This is NOT the real NetworkClient — that migration to JoinAccepted-driven
