@@ -27,14 +27,19 @@ namespace
 	constexpr float EnemyPatrolSpeed = 150.0f;    // px/s
 	constexpr Engine::Vector2 EnemySize{ 50.0f, 50.0f };
 	constexpr Engine::Color EnemyColor{ 200, 40, 40, 255 };
+
+	// Visually distinguishes remote players from the local one; purely a demo aid,
+	// never used to identify a player (that's always the server-assigned PlayerId).
+	constexpr Engine::Color RemotePlayerColor{ 255, 190, 0, 255 };
 }
 
-Game::Game()
+Game::Game(const std::string& serverEndpoint)
 	: m_Platform(PlatformPosition, PlatformSize, PlatformColor),
 	  m_Player(PlayerSpawnPosition, PlayerSize, PlayerColor),
 	  m_Enemy({ EnemyPatrolLeftBound, EnemyPatrolY }, EnemySize, EnemyColor),
 	  m_Physics(Gravity),
-	  m_EnemyPatrolDirection(1.0f)
+	  m_EnemyPatrolDirection(1.0f),
+	  m_Network(serverEndpoint)
 {
 }
 
@@ -46,6 +51,8 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 
 	UpdateEnemyPatrol(deltaTime);
 	ResolveEnemyCollision();
+
+	UpdateNetworking();
 }
 
 void Game::Render(Engine::Renderer& renderer)
@@ -53,6 +60,11 @@ void Game::Render(Engine::Renderer& renderer)
 	renderer.DrawEntity(m_Platform);
 	renderer.DrawEntity(m_Player);
 	renderer.DrawEntity(m_Enemy);
+
+	for (const auto& remotePlayer : m_RemotePlayers)
+	{
+		renderer.DrawEntity(remotePlayer.second);
+	}
 }
 
 void Game::UpdatePlayerMovement(Engine::InputManager& input)
@@ -125,4 +137,62 @@ void Game::ResolveEnemyCollision()
 
 	m_Player.SetPosition(PlayerSpawnPosition);
 	m_Player.SetVelocity({ 0.0f, 0.0f });
+}
+
+void Game::UpdateNetworking()
+{
+	Engine::Vector2 position = m_Player.GetPosition();
+	Engine::Vector2 velocity = m_Player.GetVelocity();
+	Engine::PlayerState localState{ m_Network.GetLocalPlayerId(), position.X, position.Y, velocity.X, velocity.Y };
+
+	// Synchronous, blocking exchange (documented limitation, NetworkClient.h): if it
+	// fails, keep showing the last known remote roster rather than clearing everyone.
+	if (!m_Network.SendState(localState))
+	{
+		return;
+	}
+
+	const std::vector<Engine::PlayerState>& roster = m_Network.GetLatestRoster();
+
+	std::unordered_map<Engine::PlayerId, Engine::PlayerState> latestRemoteStates;
+	for (const Engine::PlayerState& state : roster)
+	{
+		if (state.Id != m_Network.GetLocalPlayerId())
+		{
+			latestRemoteStates[state.Id] = state;
+		}
+	}
+
+	// A PlayerId absent from this snapshot has disconnected (or hasn't joined) —
+	// remove its entity so late-join and clean-disconnect are both naturally reflected.
+	for (auto it = m_RemotePlayers.begin(); it != m_RemotePlayers.end();)
+	{
+		if (latestRemoteStates.find(it->first) == latestRemoteStates.end())
+		{
+			it = m_RemotePlayers.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+
+	for (const auto& entry : latestRemoteStates)
+	{
+		Engine::PlayerId id = entry.first;
+		const Engine::PlayerState& state = entry.second;
+
+		auto existingRemotePlayer = m_RemotePlayers.find(id);
+		if (existingRemotePlayer == m_RemotePlayers.end())
+		{
+			Engine::Entity remoteEntity({ state.PositionX, state.PositionY }, PlayerSize, RemotePlayerColor);
+			remoteEntity.SetVelocity({ state.VelocityX, state.VelocityY });
+			m_RemotePlayers.emplace(id, remoteEntity);
+		}
+		else
+		{
+			existingRemotePlayer->second.SetPosition({ state.PositionX, state.PositionY });
+			existingRemotePlayer->second.SetVelocity({ state.VelocityX, state.VelocityY });
+		}
+	}
 }
