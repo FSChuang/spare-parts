@@ -5,12 +5,14 @@
 #include "Engine/Renderer/Renderer.h"
 
 #include "NetworkRate.h"
+#include "NetworkState.h"
 
 #include <SDL3/SDL_scancode.h>
 
 #include <chrono>
 #include <cmath>
 #include <unordered_set>
+#include <vector>
 
 namespace
 {
@@ -24,7 +26,7 @@ namespace
 	constexpr Engine::Color PlayerColor{ 0, 128, 255, 255 };
 
 	// Pre-connection default only (Milestone 2 Section 4 final checkpoint): once the
-	// first real Snapshot arrives, m_Platform's position is overwritten from
+	// first real Snapshot arrives, the platform object's position is overwritten from
 	// snapshot.Platform every frame and this constant is never consulted again.
 	constexpr Engine::Vector2 PlatformPosition{ 400.0f, 900.0f };
 	constexpr Engine::Vector2 PlatformSize{ 1200.0f, 40.0f };
@@ -47,13 +49,16 @@ namespace
 	// Visually distinguishes remote players from the local one; purely a demo aid,
 	// never used to identify a player (that's always the server-assigned PlayerId).
 	constexpr Engine::Color RemotePlayerColor{ 255, 190, 0, 255 };
+
+	// Local-player sentinel network id before NetworkClient's handshake has assigned a
+	// real one (Engine::Network/Protocol.h: PlayerId 0 is reserved "unassigned"). The
+	// local player GameObject always has a network-id property, even before a real id is
+	// known, so ToPlayerState() never needs a special case for "not connected yet".
+	constexpr std::uint32_t UnassignedNetworkId = 0;
 }
 
 Game::Game(const std::string& serverEndpoint)
-	: m_Platform(PlatformPosition, PlatformSize, PlatformColor),
-	  m_Player(PlayerSpawnPosition, PlayerSize, PlayerColor),
-	  m_Enemy({ EnemyPatrolLeftBound, EnemyPatrolY }, EnemySize, EnemyColor),
-	  m_Physics(Gravity),
+	: m_Physics(Gravity),
 	  m_EnemyPatrolDirection(1.0f),
 	  m_Network(serverEndpoint),
 	  // Set in the past by exactly one interval, so the very first Update() call
@@ -62,12 +67,26 @@ Game::Game(const std::string& serverEndpoint)
 	  // to "now" rather than assumed to already be far enough in the past.
 	  m_LastServerRefreshTime(std::chrono::steady_clock::now() - ServerRefreshInterval)
 {
+	Engine::GameObject& platform = m_Objects.Create(Engine::ObjectType::Platform, PlatformPosition, PlatformSize);
+	platform.SetRender(PlatformColor);
+	m_PlatformObjectId = platform.GetId();
+
+	Engine::GameObject& player = m_Objects.Create(Engine::ObjectType::Player, PlayerSpawnPosition, PlayerSize);
+	player.SetRender(PlayerColor);
+	player.SetVelocity({ 0.0f, 0.0f });
+	player.SetNetworkId(UnassignedNetworkId);
+	m_LocalPlayerObjectId = player.GetId();
+
+	Engine::GameObject& enemy =
+	    m_Objects.Create(Engine::ObjectType::Generic, { EnemyPatrolLeftBound, EnemyPatrolY }, EnemySize);
+	enemy.SetRender(EnemyColor);
+	m_EnemyObjectId = enemy.GetId();
 }
 
 void Game::Update(Engine::InputManager& input, float deltaTime)
 {
 	UpdatePlayerMovement(input);
-	m_Physics.Update(m_Player, deltaTime);
+	m_Physics.Update(*m_Objects.Find(m_LocalPlayerObjectId), deltaTime);
 	ResolvePlatformCollision();
 	ResolveOutOfBounds();
 
@@ -82,19 +101,19 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 
 void Game::Render(Engine::Renderer& renderer)
 {
-	renderer.DrawEntity(m_Platform);
-	renderer.DrawEntity(m_Player);
-	renderer.DrawEntity(m_Enemy);
-
-	for (const auto& remotePlayer : m_RemotePlayers)
+	// Every object draws itself (or doesn't): Engine::Renderer::DrawObject silently skips
+	// any object with no render property, so a future hidden object (spawn point, death
+	// zone) needs no special case here.
+	for (auto& [id, object] : m_Objects)
 	{
-		renderer.DrawEntity(remotePlayer.second);
+		renderer.DrawObject(object);
 	}
 }
 
 void Game::UpdatePlayerMovement(Engine::InputManager& input)
 {
-	Engine::Vector2 velocity = m_Player.GetVelocity();
+	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
+	Engine::Vector2 velocity = player.GetVelocity();
 
 	bool movingLeft = input.IsKeyPressed(SDL_SCANCODE_A) || input.IsKeyPressed(SDL_SCANCODE_LEFT);
 	bool movingRight = input.IsKeyPressed(SDL_SCANCODE_D) || input.IsKeyPressed(SDL_SCANCODE_RIGHT);
@@ -112,16 +131,18 @@ void Game::UpdatePlayerMovement(Engine::InputManager& input)
 		velocity.X = 0.0f;
 	}
 
-	m_Player.SetVelocity(velocity);
+	player.SetVelocity(velocity);
 }
 
 void Game::UpdateEnemyPatrol(float deltaTime)
 {
-	Engine::Vector2 velocity{ m_EnemyPatrolDirection * EnemyPatrolSpeed, 0.0f };
-	m_Enemy.SetVelocity(velocity);
-	m_Enemy.Move({ velocity.X * deltaTime, 0.0f });
+	Engine::GameObject& enemy = *m_Objects.Find(m_EnemyObjectId);
 
-	float enemyX = m_Enemy.GetPosition().X;
+	Engine::Vector2 velocity{ m_EnemyPatrolDirection * EnemyPatrolSpeed, 0.0f };
+	enemy.SetVelocity(velocity);
+	enemy.Move({ velocity.X * deltaTime, 0.0f });
+
+	float enemyX = enemy.GetPosition().X;
 	if (enemyX <= EnemyPatrolLeftBound)
 	{
 		m_EnemyPatrolDirection = 1.0f;
@@ -134,32 +155,36 @@ void Game::UpdateEnemyPatrol(float deltaTime)
 
 void Game::ResolvePlatformCollision()
 {
-	if (!Engine::IsColliding(m_Player, m_Platform))
+	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
+	Engine::GameObject& platform = *m_Objects.Find(m_PlatformObjectId);
+
+	if (!Engine::IsColliding(player, platform))
 	{
 		return;
 	}
 
-	Engine::Vector2 velocity = m_Player.GetVelocity();
+	Engine::Vector2 velocity = player.GetVelocity();
 	if (velocity.Y <= 0.0f)
 	{
 		return;
 	}
 
-	Engine::Vector2 position = m_Player.GetPosition();
-	position.Y = m_Platform.GetPosition().Y - m_Player.GetSize().Y;
-	m_Player.SetPosition(position);
+	Engine::Vector2 position = player.GetPosition();
+	position.Y = platform.GetPosition().Y - player.GetSize().Y;
+	player.SetPosition(position);
 
 	velocity.Y = 0.0f;
-	m_Player.SetVelocity(velocity);
+	player.SetVelocity(velocity);
 }
 
 void Game::ResolveOutOfBounds()
 {
-	// Entity position is its top-left corner (see ResolvePlatformCollision's own use of
+	// Object position is its top-left corner (see ResolvePlatformCollision's own use of
 	// GetPosition().Y as the top edge when landing the player on the platform), so
 	// "fully below the world" — not merely partially visible — means even the player's
 	// TOP edge has passed the logical world's bottom edge.
-	if (m_Player.GetPosition().Y >= WorldHeight)
+	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
+	if (player.GetPosition().Y >= WorldHeight)
 	{
 		RespawnPlayer();
 	}
@@ -167,7 +192,10 @@ void Game::ResolveOutOfBounds()
 
 void Game::ResolveEnemyCollision()
 {
-	if (!Engine::IsColliding(m_Player, m_Enemy))
+	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
+	Engine::GameObject& enemy = *m_Objects.Find(m_EnemyObjectId);
+
+	if (!Engine::IsColliding(player, enemy))
 	{
 		return;
 	}
@@ -177,12 +205,15 @@ void Game::ResolveEnemyCollision()
 
 void Game::RespawnPlayer()
 {
-	m_Player.SetPosition(PlayerSpawnPosition);
-	m_Player.SetVelocity({ 0.0f, 0.0f });
+	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
+	player.SetPosition(PlayerSpawnPosition);
+	player.SetVelocity({ 0.0f, 0.0f });
 }
 
 void Game::UpdateNetworking(float deltaTime)
 {
+	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
+
 	// Milestone 2 Section 5 final integration: PeerClient can only be constructed once
 	// NetworkClient's asynchronous bootstrap handshake has actually completed — its
 	// PlayerId and P2P port are not known synchronously at Game construction time.
@@ -195,13 +226,15 @@ void Game::UpdateNetworking(float deltaTime)
 		std::uint16_t localP2pPort = m_Network.GetLocalP2pPort();
 		if (localId != 0 && localP2pPort != 0)
 		{
+			player.SetNetworkId(localId);
 			m_PeerClient = std::make_unique<PeerClient>(localId, localP2pPort);
 		}
 	}
 
-	Engine::Vector2 position = m_Player.GetPosition();
-	Engine::Vector2 velocity = m_Player.GetVelocity();
-	Engine::PlayerState localState{ m_Network.GetLocalPlayerId(), position.X, position.Y, velocity.X, velocity.Y };
+	// The local player's network-relevant state, extracted from its GameObject through
+	// the explicit Milestone 3 boundary (see NetworkState.h) rather than built from a
+	// second, independent player-state representation.
+	Engine::PlayerState localState = ToPlayerState(player);
 
 	// P2P gameplay publish: Timeline-scaled, exactly as Section 4 established
 	// (0.5x/1x/2x -> ~15/30/60 Hz), now redirected to PeerClient instead of the server.
@@ -250,8 +283,9 @@ void Game::UpdateNetworking(float deltaTime)
 	// The shared moving platform is a visual/world replica of server state: its
 	// position is overwritten wholesale from the server's own authoritative
 	// computation, never locally advanced with this client's deltaTime.
-	m_Platform.SetPosition({ snapshot->Platform.PositionX, snapshot->Platform.PositionY });
-	m_Platform.SetVelocity({ snapshot->Platform.VelocityX, snapshot->Platform.VelocityY });
+	Engine::GameObject& platform = *m_Objects.Find(m_PlatformObjectId);
+	platform.SetPosition({ snapshot->Platform.PositionX, snapshot->Platform.PositionY });
+	platform.SetVelocity({ snapshot->Platform.VelocityX, snapshot->Platform.VelocityY });
 
 	// Peer directory: hand the server's current PlayerId -> P2P port mapping straight
 	// to PeerClient. PeerClient already filters out the local player's own id; Game
@@ -276,19 +310,26 @@ void Game::UpdateNetworking(float deltaTime)
 	}
 
 	// A PlayerId absent from server membership has disconnected (or hasn't joined) —
-	// remove its entity so late-join and clean-disconnect are both naturally reflected.
-	// Server membership has authority over EXISTENCE even if PeerClient still happens to
-	// hold a stale last-known state for it.
-	for (auto it = m_RemotePlayers.begin(); it != m_RemotePlayers.end();)
+	// remove its GameObject so late-join and clean-disconnect are both naturally
+	// reflected. Server membership has authority over EXISTENCE even if PeerClient
+	// still happens to hold a stale last-known state for it. The local player's own
+	// object is excluded by id, never by type/network-id filtering, since it is the
+	// only other GameObject that ever carries a network identity.
+	std::vector<Engine::ObjectId> staleRemoteObjects;
+	for (auto& [id, object] : m_Objects)
 	{
-		if (activeRemoteIds.find(it->first) == activeRemoteIds.end())
+		if (id == m_LocalPlayerObjectId || !object.HasNetworkId())
 		{
-			it = m_RemotePlayers.erase(it);
+			continue;
 		}
-		else
+		if (activeRemoteIds.find(object.GetNetworkId()) == activeRemoteIds.end())
 		{
-			++it;
+			staleRemoteObjects.push_back(id);
 		}
+	}
+	for (Engine::ObjectId id : staleRemoteObjects)
+	{
+		m_Objects.Remove(id);
 	}
 
 	if (!m_PeerClient)
@@ -303,23 +344,24 @@ void Game::UpdateNetworking(float deltaTime)
 		if (peerStateIt == latestPeerStates.end())
 		{
 			// A currently-active member with no P2P state yet (its PUB/SUB
-			// subscription may not have finished establishing) simply has no entity
-			// yet — never created from server data as a placeholder.
+			// subscription may not have finished establishing) simply has no
+			// GameObject yet — never created from server data as a placeholder.
 			continue;
 		}
 
 		const Engine::PlayerState& state = peerStateIt->second;
-		auto existingRemotePlayer = m_RemotePlayers.find(id);
-		if (existingRemotePlayer == m_RemotePlayers.end())
+		Engine::GameObject* remotePlayer = m_Objects.FindByNetworkId(id);
+		if (remotePlayer == nullptr)
 		{
-			Engine::Entity remoteEntity({ state.PositionX, state.PositionY }, PlayerSize, RemotePlayerColor);
-			remoteEntity.SetVelocity({ state.VelocityX, state.VelocityY });
-			m_RemotePlayers.emplace(id, remoteEntity);
+			Engine::GameObject& created =
+			    m_Objects.Create(Engine::ObjectType::Player, { state.PositionX, state.PositionY }, PlayerSize);
+			created.SetRender(RemotePlayerColor);
+			created.SetVelocity({ state.VelocityX, state.VelocityY });
+			created.SetNetworkId(id);
 		}
 		else
 		{
-			existingRemotePlayer->second.SetPosition({ state.PositionX, state.PositionY });
-			existingRemotePlayer->second.SetVelocity({ state.VelocityX, state.VelocityY });
+			ApplyPlayerState(*remotePlayer, state);
 		}
 	}
 }

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "Engine/Entity/Entity.h"
+#include "Engine/GameObject/GameObject.h"
+#include "Engine/GameObject/GameObjectRegistry.h"
 #include "Engine/Network/Protocol.h"
 #include "Engine/Physics/PhysicsSystem.h"
 
@@ -10,7 +11,6 @@
 #include <chrono>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 namespace Engine
 {
@@ -22,36 +22,45 @@ namespace Engine
 // controllable player affected by gravity, and a patrolling enemy. All game-specific state and
 // rules live here, never in Engine/ (ENGINEERING_SPEC.md §0, §5).
 //
+// Milestone 3: every object this game owns (the platform, the local player, the enemy, and
+// every remote player) is a plain Engine::GameObject held in one Engine::GameObjectRegistry
+// (m_Objects) — a compositional model, not an inheritance hierarchy. A static platform
+// would need no velocity property; this one is moving, so it has one. The enemy has no
+// network identity, because it is intentionally unsynchronized (see UpdateEnemyPatrol). A
+// remote player is found by its stable server-assigned PlayerId via
+// m_Objects.FindByNetworkId(), never by iteration order or array index. Render() simply
+// draws every object in the registry — GameObjects with no render property (none exist yet
+// in this checkpoint, but a future SpawnPoint/DeathZone would) are silently skipped by
+// Engine::Renderer::DrawObject, not filtered here.
+//
 // Milestone 2 Section 2: the local player is still fully client-simulated (input,
 // physics, collisions), unchanged. Remote players are visual replicas only — no local
 // input, no local physics, no local collision response, keyed explicitly by the
 // PlayerId the server assigned them (never by roster array index, which is
 // intentionally unordered).
 //
-// Milestone 2 Section 4 final checkpoint: m_Platform is now a visual/collision replica
-// of the server-authoritative moving platform, too — its position is overwritten every
-// frame from snapshot.Platform, never advanced locally with deltaTime, so it appears in
-// the same world position for every connected client regardless of that client's own
+// Milestone 2 Section 4 final checkpoint: the platform object is a visual/collision
+// replica of the server-authoritative moving platform, too — its position is overwritten
+// every frame from snapshot.Platform, never advanced locally with deltaTime, so it appears
+// in the same world position for every connected client regardless of that client's own
 // Timeline scale. The enemy remains fully local and intentionally unnetworked — this is
 // outside the P2P requirement entirely, not an oversight; its position is expected to
 // differ between clients, since each client simulates it with its own Timeline-scaled
 // deltaTime. Before the first Snapshot ever arrives (JOIN itself no longer carries
-// one), m_Platform simply keeps its static construction position — see
+// one), the platform simply keeps its static construction position — see
 // UpdateNetworking().
 //
 // Milestone 2 Section 5 final integration: remote player position/velocity now come
 // EXCLUSIVELY from PeerClient (direct peer-to-peer), never from the server Snapshot.
 // Snapshot.Roster is membership data only — it decides WHICH remote PlayerIds are
-// allowed to exist, never WHERE they are. There is no dual source of truth: search this
-// file for any line reading snapshot.Roster[...].PositionX/PositionY/VelocityX/VelocityY
-// and there is none. m_PeerClient is created lazily (once NetworkClient has learned a
-// nonzero local PlayerId and P2P port), not in the constructor, because that
-// information only becomes available asynchronously after the server's bootstrap
-// handshake completes. Local player state now reaches the network on two independent
-// schedules: a Timeline-scaled cadence for the P2P feed (0.5x/1x/2x, this project's
-// existing scale-controls-rate requirement), and a fixed real-time cadence for the
-// server session (membership/platform/peer-directory freshness, independent of Timeline
-// scale or pause) — see UpdateNetworking().
+// allowed to exist, never WHERE they are. m_PeerClient is created lazily (once
+// NetworkClient has learned a nonzero local PlayerId and P2P port), not in the
+// constructor, because that information only becomes available asynchronously after the
+// server's bootstrap handshake completes. Local player state now reaches the network on
+// two independent schedules: a Timeline-scaled cadence for the P2P feed (0.5x/1x/2x,
+// this project's existing scale-controls-rate requirement), and a fixed real-time
+// cadence for the server session (membership/platform/peer-directory freshness,
+// independent of Timeline scale or pause) — see UpdateNetworking().
 //
 // Falling off the (now-moving) platform and out the bottom of the logical world, and
 // colliding with the enemy, both respawn the player via the same RespawnPlayer() helper
@@ -73,9 +82,14 @@ private:
 	void RespawnPlayer();
 	void UpdateNetworking(float deltaTime);
 
-	Engine::Entity m_Platform;
-	Engine::Entity m_Player;
-	Engine::Entity m_Enemy;
+	// Every GameObject this client knows about: the platform, the local player, the
+	// enemy, and every currently-visible remote player. One registry, not several ad hoc
+	// containers — Render()/collision/physics all operate on it directly.
+	Engine::GameObjectRegistry m_Objects;
+	Engine::ObjectId m_PlatformObjectId;
+	Engine::ObjectId m_LocalPlayerObjectId;
+	Engine::ObjectId m_EnemyObjectId;
+
 	Engine::PhysicsSystem m_Physics;
 	float m_EnemyPatrolDirection;
 
@@ -88,7 +102,6 @@ private:
 	// leaving peers before formally leaving the server.
 	NetworkClient m_Network;
 	std::unique_ptr<PeerClient> m_PeerClient;
-	std::unordered_map<Engine::PlayerId, Engine::Entity> m_RemotePlayers;
 
 	// Milestone 2 Section 4 final checkpoint (redirected to PeerClient in Section 5's
 	// final integration): accumulates Timeline-scaled deltaTime so the local player's

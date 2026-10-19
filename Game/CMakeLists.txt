@@ -10,6 +10,7 @@ find_package(Threads REQUIRED)
 add_executable(main
     src/Game.cpp
     src/NetworkClient.cpp
+    src/NetworkState.cpp
     src/PeerClient.cpp
     src/main.cpp
 )
@@ -21,15 +22,17 @@ target_link_libraries(main PRIVATE Engine EngineNetwork Threads::Threads)
 
 # The headless multiplayer server (Milestone 2 Section 2, dedicated-session topology
 # added in Section 4 checkpoint 2, server-authoritative moving platform added in
-# Section 4's final checkpoint). Deliberately links only EngineNetwork — no Engine, so
-# no SDL3 — since it owns no window/renderer/entities; ServerPlatform.cpp only needs
-# <chrono>/<cmath> and Engine::PlatformState (already part of EngineNetwork's Protocol),
-# not SDL. Spawns one std::thread per dedicated client session, hence Threads::Threads.
+# Section 4's final checkpoint). Deliberately links EngineNetwork + EngineCore but never
+# Engine itself, so no SDL3 — it owns no window/renderer. EngineCore brings in
+# Engine::GameObject/GameObjectRegistry (Milestone 3: the server represents the shared
+# platform and connected players through the same runtime object model the client uses),
+# which has no SDL dependency of its own (see game-engine/Engine/CMakeLists.txt). Spawns
+# one std::thread per dedicated client session, hence Threads::Threads.
 add_executable(server
     src/server_main.cpp
     src/ServerPlatform.cpp
 )
-target_link_libraries(server PRIVATE EngineNetwork Threads::Threads)
+target_link_libraries(server PRIVATE EngineNetwork EngineCore Threads::Threads)
 
 # Deterministic unit test for ComputePlatformState (see ServerPlatformTest.cpp) — pure
 # function of two explicit time points, needs no running server and no real elapsed

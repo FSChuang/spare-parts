@@ -1,7 +1,11 @@
 // Spare Parts headless multiplayer server (Milestone 2 Section 4 checkpoint 2). No SDL
-// window, no Renderer, no Application, no Entity — this executable links only
-// EngineNetwork (+ Threads for its session worker threads), so it is provably SDL-free
-// at the build-graph level, not just by convention.
+// window, no Renderer, no Application — this executable links only EngineNetwork and
+// EngineCore (+ Threads for its session worker threads), so it is provably SDL-free at
+// the build-graph level, not just by convention. EngineCore brings in
+// Engine::GameObject/GameObjectRegistry (Milestone 3): the server is a network endpoint
+// that uses the same runtime object model the client does, for both the shared platform
+// (see InjectCurrentPlatformState) and connected-player presence (see g_PlayerScene) —
+// without becoming a renderer/game client itself.
 //
 // Topology: one bootstrap REP socket (JOIN only) hands each joining client a dedicated
 // REP port from a fixed pool, backed by its own session thread. This is what makes one
@@ -30,6 +34,8 @@
 // all remain permanently occupied. No heartbeat, receive timeout, lease, or crash
 // detector is implemented to bound this.
 
+#include "Engine/GameObject/GameObject.h"
+#include "Engine/GameObject/GameObjectRegistry.h"
 #include "Engine/Network/PlayerRegistry.h"
 #include "Engine/Network/ServerDispatch.h"
 #include "Engine/Network/Socket.h"
@@ -117,6 +123,13 @@ namespace
 	// boundary is sacred) — it always encodes a neutral placeholder, so this is the
 	// smallest possible spare-parts-side fix-up: decode, overwrite one field, re-encode.
 	// Error replies carry no Platform field at all, so they pass through unchanged.
+	//
+	// Milestone 3: ComputePlatformState's pure trajectory is materialized into a real
+	// Engine::GameObject (position + velocity) before being extracted back into the wire
+	// PlatformState — the runtime object model is genuinely on this reply's path, not a
+	// decoration bolted on beside it. Size is a visual-only concern the wire protocol
+	// never carries (PlatformState has no size field either), so it is left at a
+	// documented placeholder; nothing server-side reads it.
 	std::vector<std::uint8_t> InjectCurrentPlatformState(const std::vector<std::uint8_t>& replyBytes,
 	                                                       std::chrono::steady_clock::time_point serverStartTime)
 	{
@@ -133,7 +146,16 @@ namespace
 			return replyBytes;
 		}
 
-		snapshot->Platform = ComputePlatformState(serverStartTime, std::chrono::steady_clock::now());
+		Engine::PlatformState computed = ComputePlatformState(serverStartTime, std::chrono::steady_clock::now());
+
+		Engine::GameObject platformObject(0, Engine::ObjectType::Platform, { computed.PositionX, computed.PositionY },
+		                                   { 0.0f, 0.0f });
+		platformObject.SetVelocity({ computed.VelocityX, computed.VelocityY });
+
+		Engine::Vector2 platformPosition = platformObject.GetPosition();
+		Engine::Vector2 platformVelocity = platformObject.GetVelocity();
+		snapshot->Platform =
+		    Engine::PlatformState{ platformPosition.X, platformPosition.Y, platformVelocity.X, platformVelocity.Y };
 
 		// The roster/peers that produced `replyBytes` already fit within MaxPlayers (it
 		// came from HandleSessionRequest's own successful encode, with an empty peer
@@ -289,7 +311,11 @@ namespace
 	// entry was already removed from the peer directory, by its own valid Leaving
 	// before it set `Finished` — reaping only ever releases the two port NUMBERS for
 	// reuse, never touches the registry or the directory itself.
-	void ReapFinishedSessions(std::vector<SessionRecord>& sessions)
+	//
+	// Milestone 3: also removes this player's GameObject from `playerScene` (see
+	// g_PlayerScene's declaration in main() for what that registry represents and why
+	// this is the only place other than JOIN success that touches it).
+	void ReapFinishedSessions(std::vector<SessionRecord>& sessions, Engine::GameObjectRegistry& playerScene)
 	{
 		for (auto it = sessions.begin(); it != sessions.end();)
 		{
@@ -298,6 +324,7 @@ namespace
 				it->Worker.join();
 				ReleasePort(it->Port);
 				ReleaseP2pPort(it->P2pPort);
+				playerScene.RemoveByNetworkId(it->PlayerId);
 				it = sessions.erase(it);
 			}
 			else
@@ -335,6 +362,17 @@ int main(int argc, char* argv[])
 	std::vector<Engine::PeerInfo> peerDirectory;
 	std::mutex peerDirectoryMutex;
 
+	// Milestone 3: the server's own runtime-object representation of which players are
+	// currently connected — a GameObjectRegistry, not a bare id list, so the server
+	// genuinely uses the same object model the client does for this network endpoint's
+	// bookkeeping. Deliberately bootstrap-thread-only (inserted on successful JOIN,
+	// removed in ReapFinishedSessions on a session's valid Leaving) — both of those
+	// already happen exclusively on this thread for `sessions`/the port pools, so this
+	// needs no new mutex. It is intentionally presence/identity-only (no live
+	// position/velocity): no server-side behavior yet needs a connected player's
+	// position, so synchronizing that across session threads is not built until it is.
+	Engine::GameObjectRegistry playerScene;
+
 	std::printf("Spare Parts server listening (bootstrap) on %s (Ctrl-C to stop)\n", bootstrapEndpoint.c_str());
 	std::fflush(stdout);
 
@@ -343,7 +381,7 @@ int main(int argc, char* argv[])
 		std::string requestFrame = bootstrap.Receive();
 		std::vector<std::uint8_t> requestBytes(requestFrame.begin(), requestFrame.end());
 
-		ReapFinishedSessions(sessions);
+		ReapFinishedSessions(sessions, playerScene);
 
 		std::optional<Engine::MessageType> type = Engine::PeekMessageType(requestBytes);
 		if (type != Engine::MessageType::Join || !Engine::DecodeJoinRequest(requestBytes).has_value())
@@ -428,6 +466,8 @@ int main(int argc, char* argv[])
 		// become visible to anyone reading the directory. This happens strictly before
 		// JoinAccepted is sent, so by the time the new client sees its own JOIN
 		// succeed, it is already present in every other session's next Snapshot.
+		playerScene.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, { 0.0f, 0.0f }).SetNetworkId(*playerId);
+
 		{
 			std::lock_guard<std::mutex> lock(peerDirectoryMutex);
 			peerDirectory.push_back(Engine::PeerInfo{ *playerId, *p2pPort });
