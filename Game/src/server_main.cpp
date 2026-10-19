@@ -4,7 +4,7 @@
 // the build-graph level, not just by convention. EngineCore brings in
 // Engine::GameObject/GameObjectRegistry (Milestone 3): the server is a network endpoint
 // that uses the same runtime object model the client does, for both the shared platform
-// (see InjectCurrentPlatformState) and connected-player presence (see g_PlayerScene) —
+// (see InjectCurrentPlatformStates) and connected-player presence (see g_PlayerScene) —
 // without becoming a renderer/game client itself.
 //
 // Topology: one bootstrap REP socket (JOIN only) hands each joining client a dedicated
@@ -117,20 +117,22 @@ namespace
 		g_P2pPortInUse[index] = false;
 	}
 
-	// Overwrites a Snapshot reply's Platform field with the real, current
-	// server-authoritative value. Engine::HandleSessionRequest deliberately knows
+	// Overwrites a Snapshot reply's Platform/Platform2 fields with their real, current
+	// server-authoritative values. Engine::HandleSessionRequest deliberately knows
 	// nothing about real time or spare-parts world constants (CLAUDE.md: the engine/game
-	// boundary is sacred) — it always encodes a neutral placeholder, so this is the
-	// smallest possible spare-parts-side fix-up: decode, overwrite one field, re-encode.
-	// Error replies carry no Platform field at all, so they pass through unchanged.
+	// boundary is sacred) — it always encodes neutral placeholders, so this is the
+	// smallest possible spare-parts-side fix-up: decode, overwrite both fields, re-encode.
+	// Error replies carry neither field at all, so they pass through unchanged.
 	//
-	// Milestone 3: ComputePlatformState's pure trajectory is materialized into a real
-	// Engine::GameObject (position + velocity) before being extracted back into the wire
-	// PlatformState — the runtime object model is genuinely on this reply's path, not a
-	// decoration bolted on beside it. Size is a visual-only concern the wire protocol
-	// never carries (PlatformState has no size field either), so it is left at a
-	// documented placeholder; nothing server-side reads it.
-	std::vector<std::uint8_t> InjectCurrentPlatformState(const std::vector<std::uint8_t>& replyBytes,
+	// Milestone 3: each Compute*PlatformState's pure trajectory is materialized into a
+	// real Engine::GameObject (position + velocity) before being extracted back into the
+	// wire PlatformState — the runtime object model is genuinely on this reply's path,
+	// not a decoration bolted on beside it. Size is a visual-only concern the wire
+	// protocol never carries (PlatformState has no size field either), so it is left at
+	// a documented placeholder; nothing server-side reads it. Named plural (and for both
+	// platforms) since this is now the one place both server-authoritative moving
+	// objects reach the wire.
+	std::vector<std::uint8_t> InjectCurrentPlatformStates(const std::vector<std::uint8_t>& replyBytes,
 	                                                       std::chrono::steady_clock::time_point serverStartTime)
 	{
 		if (Engine::PeekMessageType(replyBytes) != Engine::MessageType::Snapshot)
@@ -146,25 +148,31 @@ namespace
 			return replyBytes;
 		}
 
-		Engine::PlatformState computed = ComputePlatformState(serverStartTime, std::chrono::steady_clock::now());
+		auto now = std::chrono::steady_clock::now();
 
-		Engine::GameObject platformObject(0, Engine::ObjectType::Platform, { computed.PositionX, computed.PositionY },
-		                                   { 0.0f, 0.0f });
-		platformObject.SetVelocity({ computed.VelocityX, computed.VelocityY });
+		Engine::PlatformState computedHorizontal = ComputePlatformState(serverStartTime, now);
+		Engine::GameObject horizontalObject(0, Engine::ObjectType::Platform,
+		                                     { computedHorizontal.PositionX, computedHorizontal.PositionY },
+		                                     { 0.0f, 0.0f });
+		horizontalObject.SetVelocity({ computedHorizontal.VelocityX, computedHorizontal.VelocityY });
+		snapshot->Platform = Engine::PlatformState{ horizontalObject.GetPosition().X, horizontalObject.GetPosition().Y,
+			                                         horizontalObject.GetVelocity().X, horizontalObject.GetVelocity().Y };
 
-		Engine::Vector2 platformPosition = platformObject.GetPosition();
-		Engine::Vector2 platformVelocity = platformObject.GetVelocity();
-		snapshot->Platform =
-		    Engine::PlatformState{ platformPosition.X, platformPosition.Y, platformVelocity.X, platformVelocity.Y };
+		Engine::PlatformState computedVertical = ComputeVerticalPlatformState(serverStartTime, now);
+		Engine::GameObject verticalObject(0, Engine::ObjectType::Platform,
+		                                   { computedVertical.PositionX, computedVertical.PositionY }, { 0.0f, 0.0f });
+		verticalObject.SetVelocity({ computedVertical.VelocityX, computedVertical.VelocityY });
+		snapshot->Platform2 = Engine::PlatformState{ verticalObject.GetPosition().X, verticalObject.GetPosition().Y,
+			                                          verticalObject.GetVelocity().X, verticalObject.GetVelocity().Y };
 
 		// The roster/peers that produced `replyBytes` already fit within MaxPlayers (it
 		// came from HandleSessionRequest's own successful encode, with an empty peer
-		// list), and only the Platform field changed here, so this re-encode cannot
+		// list), and only the two platform fields changed here, so this re-encode cannot
 		// newly exceed that bound.
 		return *Engine::EncodeSnapshot(*snapshot);
 	}
 
-	// Sibling of InjectCurrentPlatformState (Milestone 2 Section 5): overwrites a
+	// Sibling of InjectCurrentPlatformStates (Milestone 2 Section 5): overwrites a
 	// Snapshot reply's Peers field with the real, current active-PlayerId -> P2P-port
 	// directory. Same reasoning: Engine::ServerDispatch has no concept of peer
 	// discovery (bootstrap/session-port allocation is spare-parts-only, never Engine),
@@ -181,7 +189,7 @@ namespace
 		std::optional<Engine::Snapshot> snapshot = Engine::DecodeSnapshot(replyBytes);
 		if (!snapshot.has_value())
 		{
-			// Defensive only; see InjectCurrentPlatformState's identical reasoning.
+			// Defensive only; see InjectCurrentPlatformStates's identical reasoning.
 			return replyBytes;
 		}
 
@@ -264,7 +272,7 @@ namespace
 			// Platform injection needs no lock: it only reads local `replyBytes` and the
 			// immutable `serverStartTime`, and samples steady_clock — no shared mutable
 			// state at all.
-			replyBytes = InjectCurrentPlatformState(replyBytes, serverStartTime);
+			replyBytes = InjectCurrentPlatformStates(replyBytes, serverStartTime);
 
 			std::vector<Engine::PeerInfo> currentPeers;
 			{

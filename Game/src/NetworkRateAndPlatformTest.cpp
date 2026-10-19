@@ -1,7 +1,9 @@
 // Real, non-SDL-window integration test for Milestone 2 Section 5's final integration:
 // Timeline-scaled P2P message rate, fixed-real-time server-refresh rate, and
 // server-authoritative platform consistency/continuity (including while a client is
-// paused). Requires a real running production server at BootstrapEndpoint. Not
+// paused) — covering both Platform (horizontal) and, as of Milestone 3, Platform2
+// (vertical) from the same four-client observation round. Requires a real running
+// production server at BootstrapEndpoint. Not
 // CTest-registered — same rationale as the other Game/src/*IntegrationTest.cpp files (a
 // real multi-second/timing scenario, not a pure deterministic unit; ServerPlatformTest.cpp
 // covers the pure, deterministic half of the platform work separately).
@@ -89,6 +91,10 @@ namespace
 	{
 		std::chrono::steady_clock::time_point At;
 		Engine::PlatformState Platform;
+		// Milestone 3: the second server-authoritative moving platform (vertical
+		// oscillation), captured alongside Platform so both can be checked from the
+		// same four-client observation round below.
+		Engine::PlatformState Platform2;
 	};
 }
 
@@ -297,7 +303,8 @@ int main()
 			              PollIntervalMs);
 			if (gotSnapshot)
 			{
-				observations[i] = PlatformObservation{ requestTime, clients[i]->GetLatestSnapshot()->Platform };
+				std::optional<Engine::Snapshot> snapshot = clients[i]->GetLatestSnapshot();
+				observations[i] = PlatformObservation{ requestTime, snapshot->Platform, snapshot->Platform2 };
 			}
 		}
 
@@ -314,32 +321,54 @@ int main()
 			             observations[2]->Platform.PositionY == observations[3]->Platform.PositionY;
 			Check(sameY, "PlatformY_IdenticalAcrossAllFourClients");
 
+			// Milestone 3: Platform2 moves vertically, so its constant axis is X (the
+			// mirror image of Platform's constant Y above) — same cross-client agreement
+			// requirement, just on the other axis.
+			bool sameX2 = observations[0]->Platform2.PositionX == observations[1]->Platform2.PositionX &&
+			              observations[1]->Platform2.PositionX == observations[2]->Platform2.PositionX &&
+			              observations[2]->Platform2.PositionX == observations[3]->Platform2.PositionX;
+			Check(sameX2, "Platform2X_IdenticalAcrossAllFourClients");
+
 			bool consistent = true;
+			bool consistent2 = true;
 			for (int a = 0; a < ClientCount; ++a)
 			{
 				for (int b = a + 1; b < ClientCount; ++b)
 				{
 					const PlatformObservation& oa = *observations[a];
 					const PlatformObservation& ob = *observations[b];
-					if (oa.Platform.VelocityX != ob.Platform.VelocityX)
-					{
-						// A direction change happened between the two requests (rare,
-						// given the short real-time gap); skip this pair rather than
-						// asserting a linear relationship across a turning point.
-						continue;
-					}
 					double dt = std::chrono::duration<double>(ob.At - oa.At).count();
-					float expected = oa.Platform.PositionX + oa.Platform.VelocityX * static_cast<float>(dt);
-					// Generous tolerance: a few pixels, well above any plausible
-					// round-trip-latency-driven error at this platform speed.
-					if (std::fabs(ob.Platform.PositionX - expected) > 5.0f)
+
+					// A direction change happened between the two requests (rare, given
+					// the short real-time gap) skips just that platform's check for this
+					// pair, rather than asserting a linear relationship across a turning
+					// point. Platform and Platform2 have different periods, so one
+					// turning mid-pair must not suppress the other's check.
+					if (oa.Platform.VelocityX == ob.Platform.VelocityX)
 					{
-						consistent = false;
+						float expected = oa.Platform.PositionX + oa.Platform.VelocityX * static_cast<float>(dt);
+						// Generous tolerance: a few pixels, well above any plausible
+						// round-trip-latency-driven error at this platform speed.
+						if (std::fabs(ob.Platform.PositionX - expected) > 5.0f)
+						{
+							consistent = false;
+						}
+					}
+
+					if (oa.Platform2.VelocityY == ob.Platform2.VelocityY)
+					{
+						float expectedY = oa.Platform2.PositionY + oa.Platform2.VelocityY * static_cast<float>(dt);
+						if (std::fabs(ob.Platform2.PositionY - expectedY) > 5.0f)
+						{
+							consistent2 = false;
+						}
 					}
 				}
 			}
 			Check(consistent,
 			      "PlatformPositions_ConsistentWithOneSharedServerTimeTrajectory_AcrossDifferentScalesAndPause");
+			Check(consistent2,
+			      "Platform2Positions_ConsistentWithOneSharedServerTimeTrajectory_AcrossDifferentScalesAndPause");
 		}
 
 		for (std::unique_ptr<PeerClient>& peerClient : peerClients)

@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 
 add_executable(main
     src/Game.cpp
+    src/GameRules.cpp
     src/NetworkClient.cpp
     src/NetworkState.cpp
     src/PeerClient.cpp
@@ -42,6 +43,13 @@ add_executable(ServerPlatformTest
     src/ServerPlatformTest.cpp
 )
 target_link_libraries(ServerPlatformTest PRIVATE EngineNetwork)
+
+# Deterministic unit test for GameRules.h (Milestone 3: spawn selection, camera-scroll
+# threshold decision) — pure logic, no SDL, no sockets, no running server.
+add_executable(GameRulesTest
+    src/GameRules.cpp
+    src/GameRulesTest.cpp
+)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't
