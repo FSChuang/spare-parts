@@ -114,3 +114,30 @@ add_executable(P2pIntegrationTest
     src/P2pIntegrationTest.cpp
 )
 target_link_libraries(P2pIntegrationTest PRIVATE EngineNetwork Threads::Threads)
+
+# CSC 581 performance checkpoint: Full-State vs Delta-State object-exchange strategies.
+# BenchmarkStatsTest has no Engine dependency at all (pure arithmetic).
+add_executable(BenchmarkStatsTest
+    src/BenchmarkStats.cpp
+    src/BenchmarkStatsTest.cpp
+)
+
+# Correctness validation, pure logic (no sockets) — must pass before any benchmark
+# timing result is trusted. Links EngineNetworkCore only (ExchangeProtocol has no
+# ZeroMQ dependency).
+add_executable(NetworkExchangeCorrectnessTest
+    src/ExchangeStateTracking.cpp
+    src/SyntheticScene.cpp
+    src/NetworkExchangeCorrectnessTest.cpp
+)
+target_link_libraries(NetworkExchangeCorrectnessTest PRIVATE EngineNetworkCore)
+
+# The real-ZeroMQ benchmark executable: one PUB publisher thread + client_count SUB
+# receiver threads, measuring the complete encode/send/receive/decode/apply path.
+add_executable(NetworkPerformanceBenchmark
+    src/BenchmarkStats.cpp
+    src/ExchangeStateTracking.cpp
+    src/SyntheticScene.cpp
+    src/NetworkPerformanceBenchmark.cpp
+)
+target_link_libraries(NetworkPerformanceBenchmark PRIVATE EngineNetwork Threads::Threads)
