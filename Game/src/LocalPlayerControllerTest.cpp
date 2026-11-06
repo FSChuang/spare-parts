@@ -295,6 +295,35 @@ int main()
 		Check(scene.Player().GetPosition().X == 300.0f, "Spawn_ForAnotherObject_IsIgnored");
 	}
 
+	// Regression (found in a real two-client run): the Timeline reads whole milliseconds, so a
+	// fast frame can have deltaTime == 0 — gravity adds nothing and the resting player's fall
+	// speed is 0. That must NOT read as "left the ground": grounded must survive, and the next
+	// real frame must not re-raise a landing Collision (which also made jump gating flicker).
+	{
+		Scene scene;
+		scene.GroundThePlayer();
+		Check(scene.Controller->IsGrounded() && scene.SeenCollision.size() == 1, "ZeroDelta_SetupGroundedAfterOneLanding");
+
+		for (int frame = 0; frame < 20; ++frame)
+		{
+			scene.Player().SetVelocity({ 0.0f, 0.0f }); // dt == 0: physics added no gravity
+			scene.Controller->ResolvePlatformLanding();
+			scene.Events.DispatchDue();
+
+			scene.Player().SetVelocity({ 0.0f, 16.0f }); // next frame, dt > 0: gravity pushes into the floor
+			scene.PlacePlayer(100.0f, 960.0f);
+			scene.Controller->ResolvePlatformLanding();
+			scene.Events.DispatchDue();
+		}
+		Check(scene.Controller->IsGrounded(), "ZeroDelta_ZeroFallSpeedFrames_DoNotClearGrounded");
+		Check(scene.SeenCollision.size() == 1, "ZeroDelta_RestingPlayer_NeverReRaisesLandingCollision");
+
+		// Jumping must still un-ground (upward speed), and walking off an edge still must.
+		scene.Player().SetVelocity({ 0.0f, -JumpSpeed });
+		scene.Controller->ResolvePlatformLanding();
+		Check(!scene.Controller->IsGrounded(), "ZeroDelta_UpwardSpeed_StillClearsGrounded");
+	}
+
 	// Initial spawn path: RequestSpawn is the same event, handled the same way.
 	{
 		Scene scene;

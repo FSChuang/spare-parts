@@ -116,6 +116,16 @@ void LocalPlayerController::ResolvePlatformLanding()
 			return;
 		}
 	}
+	else if (velocity.Y == 0.0f && m_IsGrounded)
+	{
+		// Resting with no fall speed is NOT leaving the ground. The Timeline reads whole
+		// milliseconds, so a fast frame can have deltaTime == 0: gravity adds nothing and the
+		// player's fall speed is exactly 0. Clearing grounded here would make the next real
+		// frame "land" again and re-raise the landing Collision every few frames (and make
+		// jump gating flicker). Only upward speed (a jump) or a fall that finds no platform
+		// under the player ends the grounded state.
+		return;
+	}
 
 	m_IsGrounded = false;
 }
