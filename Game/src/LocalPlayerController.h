@@ -104,6 +104,17 @@ public:
 	/// respawns after death request theirs through the Death handler).
 	void RequestSpawn(Engine::Vector2 position);
 
+	/// Replay playback gate (Milestone 4 Checkpoint 4). While on, this controller does not
+	/// drive the live player: its Input/Collision/Death/Spawn handlers ignore the events they
+	/// receive (replayed events are dispatched through the same EventManager but only OBSERVED,
+	/// the recorded state samples own the player), and the per-frame input, movement, landing
+	/// and hazard methods do nothing. Turning it off resumes normal gameplay unchanged.
+	void SetPlaybackMode(bool playback);
+	bool IsPlaybackMode() const;
+
+	/// Overwrites the grounded state; used only to restore a saved state after a replay.
+	void SetGrounded(bool grounded);
+
 	/// True while the player is resting on a platform (landing grants it, a jump, leaving
 	/// the platform, or a spawn clears it).
 	bool IsGrounded() const;
@@ -137,6 +148,7 @@ private:
 	bool m_IsGrounded = false;
 	float m_CameraOffsetX = 0.0f;
 	bool m_DeathRaisedThisFrame = false;
+	bool m_PlaybackMode = false;
 
 	// Declared last: destroyed first, unsubscribing while the EventManager is still alive.
 	Engine::ScopedSubscription m_InputSubscription;

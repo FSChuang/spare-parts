@@ -41,6 +41,11 @@ void LocalPlayerController::BeginFrame()
 
 void LocalPlayerController::RaiseInputEvents(bool leftHeld, bool rightHeld, bool jumpPressed)
 {
+	if (m_PlaybackMode)
+	{
+		return; // live input must not reach a replayed player (and the held-key memory stays put)
+	}
+
 	if (leftHeld != m_LeftHeldLastFrame)
 	{
 		m_LeftHeldLastFrame = leftHeld;
@@ -61,6 +66,11 @@ void LocalPlayerController::RaiseInputEvents(bool leftHeld, bool rightHeld, bool
 
 void LocalPlayerController::ApplyHorizontalMovement()
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	Engine::GameObject& player = Player();
 	Engine::Vector2 velocity = player.GetVelocity();
 
@@ -82,6 +92,11 @@ void LocalPlayerController::ApplyHorizontalMovement()
 
 void LocalPlayerController::ResolvePlatformLanding()
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	Engine::GameObject& player = Player();
 	Engine::Vector2 velocity = player.GetVelocity();
 
@@ -132,6 +147,11 @@ void LocalPlayerController::ResolvePlatformLanding()
 
 void LocalPlayerController::DetectHazardCollisions()
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	Engine::GameObject& player = Player();
 
 	for (Engine::ObjectId hazardId : { m_Ids.DeathZone, m_Ids.Enemy })
@@ -147,6 +167,21 @@ void LocalPlayerController::DetectHazardCollisions()
 void LocalPlayerController::RequestSpawn(Engine::Vector2 position)
 {
 	m_Events.Raise(Engine::SpawnEventData{ m_Ids.Player, position }, SpawnEventPriority);
+}
+
+void LocalPlayerController::SetPlaybackMode(bool playback)
+{
+	m_PlaybackMode = playback;
+}
+
+bool LocalPlayerController::IsPlaybackMode() const
+{
+	return m_PlaybackMode;
+}
+
+void LocalPlayerController::SetGrounded(bool grounded)
+{
+	m_IsGrounded = grounded;
 }
 
 bool LocalPlayerController::IsGrounded() const
@@ -166,6 +201,11 @@ void LocalPlayerController::SetCameraOffsetX(float offsetX)
 
 void LocalPlayerController::OnInput(const Engine::InputEventData& input)
 {
+	if (m_PlaybackMode)
+	{
+		return; // replayed events are observed, never acted on live
+	}
+
 	switch (input.Action)
 	{
 	case Engine::InputAction::MoveLeft:
@@ -193,6 +233,11 @@ void LocalPlayerController::OnInput(const Engine::InputEventData& input)
 
 void LocalPlayerController::OnCollision(const Engine::CollisionEventData& collision)
 {
+	if (m_PlaybackMode)
+	{
+		return; // replayed events are observed, never acted on live
+	}
+
 	Engine::ObjectId otherId = collision.A == m_Ids.Player ? collision.B : collision.A;
 	const Engine::GameObject* other = m_Objects.Find(otherId);
 	if (other == nullptr || (collision.A != m_Ids.Player && collision.B != m_Ids.Player))
@@ -225,6 +270,11 @@ void LocalPlayerController::RaiseDeath(Engine::ObjectId cause)
 
 void LocalPlayerController::OnDeath(const Engine::DeathEventData& death)
 {
+	if (m_PlaybackMode)
+	{
+		return; // replayed events are observed, never acted on live
+	}
+
 	if (death.Subject != m_Ids.Player)
 	{
 		return;
@@ -236,6 +286,11 @@ void LocalPlayerController::OnDeath(const Engine::DeathEventData& death)
 
 void LocalPlayerController::OnSpawn(const Engine::SpawnEventData& spawn)
 {
+	if (m_PlaybackMode)
+	{
+		return; // replayed events are observed, never acted on live
+	}
+
 	if (spawn.Subject != m_Ids.Player)
 	{
 		return;

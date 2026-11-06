@@ -110,6 +110,16 @@ namespace
 	// (Milestone 4 networked Death event) — purely presentational, never networked.
 	constexpr Engine::Color RemotePlayerDeadColor{ 255, 255, 255, 255 };
 
+	// The local player is drawn in this color while a replay is playing, so it is obvious
+	// that what is on screen is the recording and not live play.
+	constexpr Engine::Color ReplayPlayerColor{ 0, 220, 120, 255 };
+
+	// Replay controls (Milestone 4). F-keys, so they never clash with movement, jump, or the
+	// engine's own Tab / P / 1-2-3 debug keys. (On a Mac laptop hold fn if the OS claims them.)
+	constexpr SDL_Scancode ReplayStartKey = SDL_SCANCODE_F5;
+	constexpr SDL_Scancode ReplayStopKey = SDL_SCANCODE_F6;
+	constexpr SDL_Scancode ReplayPlayKey = SDL_SCANCODE_F7;
+
 	// Local-player sentinel network id before NetworkClient's handshake has assigned a
 	// real one (Engine::Network/Protocol.h: PlayerId 0 is reserved "unassigned"). The
 	// local player GameObject always has a network-id property, even before a real id is
@@ -163,7 +173,7 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 	// only exists once the server handshake has completed — before that there is nobody to
 	// tell. (PublishEvent just queues; the PeerClient worker does the sending.)
 	m_PeerEvents = std::make_unique<PeerEventBridge>(
-	    m_Events, m_Objects, m_LocalPlayerObjectId, std::move(timeSource),
+	    m_Events, m_Objects, m_LocalPlayerObjectId, timeSource,
 	    [this](Engine::NetworkEventKind kind)
 	    {
 		    if (m_PeerClient)
@@ -171,6 +181,11 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 			    m_PeerClient->PublishEvent(kind);
 		    }
 	    });
+
+	m_Replay = std::make_unique<ReplayController>(
+	    m_Events, m_Objects, *m_LocalPlayer, *m_PeerEvents,
+	    ReplayObjects{ m_LocalPlayerObjectId, m_PlatformObjectId, m_VerticalPlatformObjectId, m_EnemyObjectId },
+	    std::move(timeSource));
 }
 
 void Game::CreateMovingPlatforms()
@@ -242,10 +257,15 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	// Frame order, with two deliberate event-dispatch phases:
 	//
 	//  1. BeginFrame        allow a new death this frame
-	//  2. PollInputEvents   held-key CHANGES and fresh jump presses become Input events
-	//  3. DispatchDue #1    input effects apply BEFORE physics (move intent, jump impulse);
-	//                       also delivers the initial Spawn on the first frame
-	//  4. ApplyHorizontalMovement + physics integration (direct, not events)
+	//  2. PollInputEvents   replay keys (F5/F6/F7) and held-key CHANGES / fresh jump presses
+	//                       become events
+	//  3. DispatchDue #1    replay control takes effect; input effects apply BEFORE physics
+	//                       (move intent, jump impulse); the initial Spawn is delivered on the
+	//                       first frame; while a replay plays, its re-scheduled events are
+	//                       delivered here (observed only)
+	//
+	//  LIVE (not replaying):
+	//  4. movement + physics integration (direct, not events)
 	//  5. enemy patrol      direct local simulation, before the hazard test so the player
 	//                       is tested against the enemy's position this frame
 	//  6. landing + hazard detection (direct geometry); a NEW landing, or touching the death
@@ -254,26 +274,41 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	//                       Spawn). A death never waits for the next frame, and the
 	//                       respawned position/camera are final before networking reads them
 	//  8. scrolling         camera snap on boundary contact (direct presentation math)
-	//  9. networking        publishes this frame's final player state
+	//  (While a replay PLAYS, 4-8 are skipped: the recorded frames own the player, the
+	//   platforms, the enemy and the camera, and nothing live may touch them.)
+	//
+	//  9. networking        publishes this frame's final player state (the saved live state,
+	//                       not the replay, while one plays)
+	// 10. UpdatePlayback    applies the recorded frame for the elapsed playback time, and
+	//                       ends playback (restoring the live state) when the span is over;
+	//                       it runs AFTER networking so the recording wins over the live
+	//                       platform positions networking just wrote
+	// 11. CaptureFrame      while recording, stores this frame's final state
 	m_LocalPlayer->BeginFrame();
 
 	PollInputEvents(input);
 	m_Events.DispatchDue();
 
-	m_LocalPlayer->ApplyHorizontalMovement();
-	m_Physics.Update(*m_Objects.Find(m_LocalPlayerObjectId), deltaTime);
+	if (!m_Replay->IsPlaying())
+	{
+		m_LocalPlayer->ApplyHorizontalMovement();
+		m_Physics.Update(*m_Objects.Find(m_LocalPlayerObjectId), deltaTime);
 
-	UpdateEnemyPatrol(deltaTime);
+		UpdateEnemyPatrol(deltaTime);
 
-	m_LocalPlayer->ResolvePlatformLanding();
-	m_LocalPlayer->DetectHazardCollisions();
-	m_Events.DispatchDue();
+		m_LocalPlayer->ResolvePlatformLanding();
+		m_LocalPlayer->DetectHazardCollisions();
+		m_Events.DispatchDue();
 
-	UpdateScrolling();
+		UpdateScrolling();
+	}
 
-	// Networking runs last so it always publishes this frame's final player state —
-	// never a stale pre-respawn position.
+	// Networking runs after the local simulation so it always publishes this frame's final
+	// player state — never a stale pre-respawn position.
 	UpdateNetworking(deltaTime);
+
+	m_Replay->UpdatePlayback();
+	m_Replay->CaptureFrame();
 }
 
 void Game::Render(Engine::Renderer& renderer)
@@ -298,6 +333,10 @@ void Game::Render(Engine::Renderer& renderer)
 		{
 			view.SetRender(RemotePlayerDeadColor);
 		}
+		else if (id == m_LocalPlayerObjectId && m_Replay->IsPlaying())
+		{
+			view.SetRender(ReplayPlayerColor);
+		}
 		renderer.DrawObject(view);
 	}
 }
@@ -314,6 +353,21 @@ void Game::PollInputEvents(Engine::InputManager& input)
 	                    input.IsKeyJustPressed(SDL_SCANCODE_UP);
 
 	m_LocalPlayer->RaiseInputEvents(movingLeft, movingRight, jumpPressed);
+
+	// Replay controls are raised as EVENTS (never calling the recorder directly); the
+	// ReplayController / ReplayRecorder react when they are dispatched.
+	if (input.IsKeyJustPressed(ReplayStartKey))
+	{
+		m_Replay->RequestStartRecording();
+	}
+	if (input.IsKeyJustPressed(ReplayStopKey))
+	{
+		m_Replay->RequestStopRecording();
+	}
+	if (input.IsKeyJustPressed(ReplayPlayKey))
+	{
+		m_Replay->RequestPlayback();
+	}
 }
 
 void Game::UpdateEnemyPatrol(float deltaTime)
@@ -388,6 +442,16 @@ void Game::UpdateNetworking(float deltaTime)
 	// the explicit Milestone 3 boundary (see NetworkState.h) rather than built from a
 	// second, independent player-state representation.
 	Engine::PlayerState localState = ToPlayerState(player);
+	if (m_Replay->IsPlaying())
+	{
+		// The player GameObject currently shows the recording. Peers must never see that as
+		// movement, so keep publishing where the real player stood when playback began.
+		const GameplaySample& live = m_Replay->SavedLiveSample();
+		localState.PositionX = live.PlayerPosition.X;
+		localState.PositionY = live.PlayerPosition.Y;
+		localState.VelocityX = live.PlayerVelocity.X;
+		localState.VelocityY = live.PlayerVelocity.Y;
+	}
 
 	// P2P gameplay publish: Timeline-scaled, exactly as Section 4 established
 	// (0.5x/1x/2x -> ~15/30/60 Hz), now redirected to PeerClient instead of the server.
@@ -528,9 +592,10 @@ void Game::SubscribeEventLogging()
 	// One concise line per event, so a manual run can show all four required event types
 	// firing. Input and Collision are transition-only (not per-frame), and Death/Spawn are
 	// rare, so this never floods the console. Gameplay does not depend on any of it.
-	auto logEvent = [](const Engine::Event& event)
+	auto logEvent = [this](const Engine::Event& event)
 	{
-		std::printf("[Event t=%.2f] ", event.Timestamp);
+		// Events dispatched while a replay plays are the recording being re-run.
+		std::printf("[Event t=%.2f%s] ", event.Timestamp, (m_Replay && m_Replay->IsPlaying()) ? " replay" : "");
 		switch (event.Type)
 		{
 		case Engine::EventType::Input:
@@ -560,12 +625,23 @@ void Game::SubscribeEventLogging()
 			std::printf("Spawn object %u at (%.0f, %.0f)\n", spawn.Subject, spawn.Position.X, spawn.Position.Y);
 			break;
 		}
+		case Engine::EventType::ReplayStart:
+			std::printf("ReplayStart\n");
+			break;
+		case Engine::EventType::ReplayStop:
+			std::printf("ReplayStop\n");
+			break;
+		case Engine::EventType::ReplayPlay:
+			std::printf("ReplayPlay\n");
+			break;
 		}
 		std::fflush(stdout);
 	};
 
 	for (Engine::EventType type : { Engine::EventType::Input, Engine::EventType::Collision,
-	                                 Engine::EventType::Death, Engine::EventType::Spawn })
+	                                 Engine::EventType::Death, Engine::EventType::Spawn,
+	                                 Engine::EventType::ReplayStart, Engine::EventType::ReplayStop,
+	                                 Engine::EventType::ReplayPlay })
 	{
 		m_EventLogSubscriptions.emplace_back(m_Events, type, logEvent);
 	}

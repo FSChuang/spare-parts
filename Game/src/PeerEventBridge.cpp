@@ -44,7 +44,10 @@ void PeerEventBridge::OnDeath(const Engine::Event& event)
 	if (death.Subject == m_LocalPlayerObjectId)
 	{
 		// The local player died (LocalPlayerController is handling the respawn): tell peers.
-		m_SendToPeers(Engine::NetworkEventKind::Death);
+		if (m_AnnounceEnabled)
+		{
+			m_SendToPeers(Engine::NetworkEventKind::Death);
+		}
 		return;
 	}
 
@@ -55,6 +58,11 @@ void PeerEventBridge::OnDeath(const Engine::Event& event)
 	{
 		m_MarkerExpiry[death.Subject] = event.Timestamp + MarkDuration;
 	}
+}
+
+void PeerEventBridge::SetAnnounceEnabled(bool enabled)
+{
+	m_AnnounceEnabled = enabled;
 }
 
 bool PeerEventBridge::IsMarkedDead(Engine::ObjectId remoteObjectId) const

@@ -60,6 +60,11 @@ public:
 	/// Returns false, raising nothing, if no remote object has that network PlayerId.
 	bool HandleNetworkEvent(const Engine::NetworkEvent& networkEvent);
 
+	/// While disabled, a local Death is NOT announced to peers. Game turns this off during
+	/// replay playback so a replayed death is never broadcast as a new one. Remote
+	/// notifications and markers are unaffected (peers are live during a local replay).
+	void SetAnnounceEnabled(bool enabled);
+
 	/// True while the remote object is within its marked-dead window.
 	bool IsMarkedDead(Engine::ObjectId remoteObjectId) const;
 
@@ -78,6 +83,8 @@ private:
 
 	// Remote object -> logical time its marker expires.
 	std::unordered_map<Engine::ObjectId, double> m_MarkerExpiry;
+
+	bool m_AnnounceEnabled = true;
 
 	// Declared last: destroyed first, unsubscribing while m_Events is still alive.
 	Engine::ScopedSubscription m_DeathSubscription;

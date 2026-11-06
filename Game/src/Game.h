@@ -10,6 +10,7 @@
 #include "NetworkClient.h"
 #include "PeerClient.h"
 #include "PeerEventBridge.h"
+#include "ReplayController.h"
 
 #include <chrono>
 #include <functional>
@@ -186,4 +187,10 @@ private:
 	// PeerEventBridge.h). Declared last for the same reason as m_LocalPlayer: its Death
 	// subscription must be released while m_Events is still alive.
 	std::unique_ptr<PeerEventBridge> m_PeerEvents;
+
+	// Milestone 4 Checkpoint 4: record / play back the local player's gameplay (F5 start,
+	// F6 stop, F7 play — each raises a replay control event). Declared last: it references
+	// m_LocalPlayer and m_PeerEvents and must release its subscriptions before them and
+	// before m_Events.
+	std::unique_ptr<ReplayController> m_Replay;
 };

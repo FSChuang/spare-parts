@@ -15,6 +15,7 @@ add_executable(main
     src/NetworkState.cpp
     src/PeerClient.cpp
     src/PeerEventBridge.cpp
+    src/ReplayController.cpp
     src/main.cpp
 )
 
@@ -83,6 +84,19 @@ add_executable(PeerEventBridgeTest
     src/PeerEventBridgeTest.cpp
 )
 target_link_libraries(PeerEventBridgeTest PRIVATE EngineCore EngineNetworkCore)
+
+# Milestone 4 Checkpoint 4: Spare Parts replay (state samples, playback, live-state restore,
+# suppression of live input/hazards/network announcements during playback). Real
+# EventManager/ReplayRecorder/LocalPlayerController/PeerEventBridge/GameObjects on a fake
+# clock; no SDL, no sockets.
+add_executable(ReplayControllerTest
+    src/ReplayController.cpp
+    src/PeerEventBridge.cpp
+    src/LocalPlayerController.cpp
+    src/GameRules.cpp
+    src/ReplayControllerTest.cpp
+)
+target_link_libraries(ReplayControllerTest PRIVATE EngineCore EngineNetworkCore)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't
