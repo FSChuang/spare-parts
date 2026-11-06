@@ -14,6 +14,7 @@ add_executable(main
     src/NetworkClient.cpp
     src/NetworkState.cpp
     src/PeerClient.cpp
+    src/PeerEventBridge.cpp
     src/main.cpp
 )
 
@@ -71,6 +72,18 @@ add_executable(LocalPlayerControllerTest
 )
 target_link_libraries(LocalPlayerControllerTest PRIVATE EngineCore)
 
+# Milestone 4 Checkpoint 3: the network-event <-> local-event bridge (local death announce,
+# remote death notification -> local Death event + marker, expiry, unknown ids, local/remote
+# separation). Real EventManager/GameObjects/LocalPlayerController with a fake clock; no
+# sockets (the PeerClient transport is proven in PeerClientIntegrationTest). No SDL.
+add_executable(PeerEventBridgeTest
+    src/PeerEventBridge.cpp
+    src/LocalPlayerController.cpp
+    src/GameRules.cpp
+    src/PeerEventBridgeTest.cpp
+)
+target_link_libraries(PeerEventBridgeTest PRIVATE EngineCore EngineNetworkCore)
+
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't
 # CTest-registered). Requires a real `server` already running at its endpoint.
@@ -120,9 +133,10 @@ target_link_libraries(NetworkRateAndPlatformTest PRIVATE Engine EngineNetwork Th
 # this checkpoint proves it independently, before any Game integration.
 add_executable(PeerClientIntegrationTest
     src/PeerClient.cpp
+    src/PeerEventBridge.cpp
     src/PeerClientIntegrationTest.cpp
 )
-target_link_libraries(PeerClientIntegrationTest PRIVATE EngineNetwork Threads::Threads)
+target_link_libraries(PeerClientIntegrationTest PRIVATE EngineNetwork EngineCore Threads::Threads)
 
 # Real, non-SDL integration test for Milestone 2 Section 5's final integration: the
 # server-Roster/P2P directness proof and the required real multi-client scenario (see

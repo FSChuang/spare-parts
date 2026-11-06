@@ -16,12 +16,17 @@
 // file (a real multi-second/timing scenario, not a pure deterministic unit).
 
 #include "PeerClient.h"
+#include "PeerEventBridge.h"
 
+#include "Engine/Event/EventManager.h"
+#include "Engine/GameObject/GameObjectRegistry.h"
+#include "Engine/Network/EventProtocol.h"
 #include "Engine/Network/Protocol.h"
 #include "Engine/Network/Socket.h"
 
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -85,6 +90,55 @@ namespace
 	std::string ToFrame(const std::vector<std::uint8_t>& bytes)
 	{
 		return std::string(bytes.begin(), bytes.end());
+	}
+
+	// PUB/SUB drops anything published before the subscription finishes connecting, and an
+	// event (unlike state) must never be re-sent to compensate — that would break the
+	// "exactly one" checks. So: publish STATE until the peer provably receives it (which proves
+	// the subscription is live), and only then publish events.
+	bool WarmUp(PeerClient& from, Engine::PlayerId fromId, PeerClient& to)
+	{
+		Engine::PlayerState warm{ fromId, 1.0f, 2.0f, 0.0f, 0.0f };
+		return WaitUntil(
+		    [&]()
+		    {
+			    from.PublishState(warm);
+			    return to.GetLatestPeerStates().find(fromId) != to.GetLatestPeerStates().end();
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+	}
+
+	// Polls (on THIS thread, as Game does) until `expected` notifications have been collected
+	// or the timeout passes; returns everything collected, in arrival order.
+	std::vector<Engine::NetworkEvent> CollectEvents(PeerClient& client, std::size_t expected, int timeoutMs)
+	{
+		std::vector<Engine::NetworkEvent> collected;
+		WaitUntil(
+		    [&]()
+		    {
+			    for (const Engine::NetworkEvent& event : client.PollEvents())
+			    {
+				    collected.push_back(event);
+			    }
+			    return collected.size() >= expected;
+		    },
+		    timeoutMs, PollIntervalMs);
+		return collected;
+	}
+
+	// Keeps polling for a quiet period and returns whatever extra arrived (to prove "exactly").
+	std::vector<Engine::NetworkEvent> DrainFor(PeerClient& client, int durationMs)
+	{
+		std::vector<Engine::NetworkEvent> extra;
+		for (int elapsed = 0; elapsed < durationMs; elapsed += PollIntervalMs)
+		{
+			for (const Engine::NetworkEvent& event : client.PollEvents())
+			{
+				extra.push_back(event);
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(PollIntervalMs));
+		}
+		return extra;
 	}
 }
 
@@ -287,6 +341,216 @@ int main()
 		auto readDuration = std::chrono::steady_clock::now() - readStart;
 		(void)states;
 		Check(readDuration < std::chrono::milliseconds(50), "NonBlocking_GetLatestPeerStates_ReturnsWithoutNetworkBlocking");
+	}
+
+
+	// ===== Milestone 4 Checkpoint 3: gameplay event notifications over the same channel =====
+
+	// --- Test 7: one peer publishes a Death event; the other receives exactly one ---
+	{
+		PeerClient a(1, 6201);
+		PeerClient b(2, 6202);
+		a.UpdatePeers({ MakePeer(2, 6202) });
+		b.UpdatePeers({ MakePeer(1, 6201) });
+		Check(WarmUp(a, 1, b), "Event_Setup_SubscriptionEstablished");
+
+		a.PublishEvent(Engine::NetworkEventKind::Death);
+		std::vector<Engine::NetworkEvent> received = CollectEvents(b, 1, PollTimeoutMs);
+		Check(received.size() == 1 && received[0].Kind == Engine::NetworkEventKind::Death &&
+		          received[0].SourcePlayerId == 1,
+		      "Event_Death_ReceivedByPeerWithSenderPlayerId");
+		Check(DrainFor(b, 300).empty(), "Event_Death_ReceivedExactlyOnce");
+		Check(a.PollEvents().empty(), "Event_SenderNeverReceivesItsOwnEvent");
+	}
+
+	// --- Test 8: several events are each delivered (a queue, not a latest-wins slot) ---
+	{
+		PeerClient a(1, 6211);
+		PeerClient b(2, 6212);
+		a.UpdatePeers({ MakePeer(2, 6212) });
+		b.UpdatePeers({ MakePeer(1, 6211) });
+		WarmUp(a, 1, b);
+
+		const std::size_t eventCount = 25;
+		for (std::size_t i = 0; i < eventCount; ++i)
+		{
+			a.PublishEvent(Engine::NetworkEventKind::Death); // back to back: a slot would keep only the last
+		}
+		std::vector<Engine::NetworkEvent> received = CollectEvents(b, eventCount, PollTimeoutMs);
+		Check(received.size() == eventCount, "Event_BurstOfEvents_NoneOverwrittenOrCoalesced");
+		Check(DrainFor(b, 200).empty(), "Event_BurstOfEvents_NoneDuplicated");
+	}
+
+	// --- Test 9: state and event frames interleaved on one channel stay independent ---
+	{
+		PeerClient a(1, 6221);
+		PeerClient b(2, 6222);
+		a.UpdatePeers({ MakePeer(2, 6222) });
+		b.UpdatePeers({ MakePeer(1, 6221) });
+		WarmUp(a, 1, b);
+
+		const std::size_t eventCount = 10;
+		Engine::PlayerState last{};
+		for (std::size_t i = 0; i < eventCount; ++i)
+		{
+			last = Engine::PlayerState{ 1, 100.0f + static_cast<float>(i), 50.0f, 3.0f, 4.0f };
+			a.PublishState(last);
+			a.PublishEvent(Engine::NetworkEventKind::Death);
+			std::this_thread::sleep_for(std::chrono::milliseconds(15));
+		}
+		std::vector<Engine::NetworkEvent> received = CollectEvents(b, eventCount, PollTimeoutMs);
+		Check(received.size() == eventCount, "Interleaved_EveryEventStillDelivered");
+		bool stateIntact = WaitUntil([&]() { return StateMatches(b.GetLatestPeerStates(), 1, last); }, PollTimeoutMs,
+		                              PollIntervalMs);
+		Check(stateIntact, "Interleaved_LatestStateStillExact");
+		Check(DrainFor(b, 200).empty(), "Interleaved_EventsNeverDuplicatedByStateFrames");
+	}
+
+	// --- Test 10: bad frames are ignored without crashing, and never fed to the wrong decoder ---
+	{
+		PeerClient a(1, 6231);
+		Engine::Socket rawPub(Engine::SocketRole::Publish); // stands in for peer 99's declared endpoint
+		rawPub.Bind("tcp://*:6299");
+		a.UpdatePeers({ MakePeer(99, 6299) });
+
+		std::string eventFrame = ToFrame(Engine::EncodeNetworkEvent({ Engine::NetworkEventKind::Death, 99 }));
+		std::string truncated = eventFrame.substr(0, 3);
+		std::string unknownKind = eventFrame;
+		unknownKind[1] = 77;
+		std::string stateFrame = ToFrame(Engine::EncodeStateUpdate(Engine::StateUpdate{ Engine::PlayerState{ 99, 5.0f, 6.0f, 0.0f, 0.0f }, false }));
+		std::string strangerFrame = ToFrame(Engine::EncodeNetworkEvent({ Engine::NetworkEventKind::Death, 55 }));
+
+		// Keep sending across the slow-joiner window; every frame here must be rejected.
+		for (int attempt = 0; attempt < 100; ++attempt)
+		{
+			rawPub.Send(truncated);
+			rawPub.Send(unknownKind);
+			rawPub.Send(strangerFrame); // well-formed, but from a player not in the directory
+			rawPub.Send(stateFrame);    // valid state: must update state, must NOT become an event
+			std::this_thread::sleep_for(std::chrono::milliseconds(PollIntervalMs));
+		}
+		Check(a.PollEvents().empty(), "BadEventFrames_TruncatedUnknownKindAndStrangerSource_Ignored");
+		Check(StateMatches(a.GetLatestPeerStates(), 99, Engine::PlayerState{ 99, 5.0f, 6.0f, 0.0f, 0.0f }),
+		      "BadEventFrames_DoNotDisturbStateFramesOnTheSameChannel");
+
+		// Once a valid event from the directory peer arrives it is accepted.
+		bool accepted = WaitUntil(
+		    [&]()
+		    {
+			    rawPub.Send(eventFrame);
+			    return !a.PollEvents().empty();
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+		Check(accepted, "BadEventFrames_ValidEventFromDirectoryPeer_StillAccepted");
+	}
+
+	// --- Test 11: the worker never touches an EventManager; only the polling thread does ---
+	{
+		PeerClient a(1, 6241);
+		PeerClient b(2, 6242);
+		a.UpdatePeers({ MakePeer(2, 6242) });
+		b.UpdatePeers({ MakePeer(1, 6241) });
+		WarmUp(a, 1, b);
+
+		double now = 0.0;
+		Engine::EventManager manager([&]() { return now; });
+		std::thread::id handlerThread;
+		int handled = 0;
+		Engine::ScopedSubscription subscription(manager, Engine::EventType::Death,
+		                                        [&](const Engine::Event&)
+		                                        {
+			                                        handlerThread = std::this_thread::get_id();
+			                                        ++handled;
+		                                        });
+
+		a.PublishEvent(Engine::NetworkEventKind::Death);
+		for (const Engine::NetworkEvent& event : CollectEvents(b, 1, PollTimeoutMs))
+		{
+			manager.Raise(Engine::DeathEventData{ event.SourcePlayerId, Engine::NoObjectId });
+		}
+		Check(manager.PendingCount() == 1 && handled == 0,
+		      "ThreadOwnership_ReceivedEventIsOnlyQueuedUntilMainThreadDispatches");
+		manager.DispatchDue();
+		Check(handled == 1 && handlerThread == std::this_thread::get_id(),
+		      "ThreadOwnership_EventHandledOnTheMainThread");
+	}
+
+	// --- Test 12: peer-directory refresh / disconnect around pending events is safe ---
+	{
+		PeerClient a(1, 6251);
+		PeerClient b(2, 6252);
+		a.UpdatePeers({ MakePeer(2, 6252) });
+		b.UpdatePeers({ MakePeer(1, 6251) });
+		WarmUp(a, 1, b);
+
+		a.PublishEvent(Engine::NetworkEventKind::Death);
+		b.UpdatePeers({}); // b drops a right as the event is in flight
+		std::this_thread::sleep_for(std::chrono::milliseconds(150));
+		b.PollEvents(); // whatever beat the removal is fine; nothing may crash
+		for (int i = 0; i < 3; ++i)
+		{
+			a.PublishEvent(Engine::NetworkEventKind::Death);
+		}
+		Check(DrainFor(b, 300).empty(), "PeerRefresh_RemovedPeersEventsAreNoLongerDelivered");
+
+		b.UpdatePeers({ MakePeer(1, 6251) }); // and a rejoining peer works again
+		WarmUp(a, 1, b);
+		a.PublishEvent(Engine::NetworkEventKind::Death);
+		Check(CollectEvents(b, 1, PollTimeoutMs).size() >= 1, "PeerRefresh_ReaddedPeerDeliversEventsAgain");
+	}
+
+
+	// --- Test 13: the whole path, two miniature "games", real PeerClient hop in the middle ---
+	// A's local Death event -> A's bridge -> PeerClient PUB -> B's PeerClient SUB -> B polls ->
+	// B's bridge -> B's own EventManager (on a DIFFERENT logical clock) -> visible marker on B.
+	{
+		struct World
+		{
+			World(Engine::PlayerId localId, Engine::PlayerId remoteId, double startTime, PeerClient& peer)
+				: Now(startTime), Events([this]() { return Now; })
+			{
+				Engine::GameObject& local = Objects.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, { 50.0f, 50.0f });
+				local.SetNetworkId(localId);
+				LocalObjectId = local.GetId();
+				Engine::GameObject& remote = Objects.Create(Engine::ObjectType::Player, { 300.0f, 0.0f }, { 50.0f, 50.0f });
+				remote.SetNetworkId(remoteId);
+				RemoteObjectId = remote.GetId();
+				Bridge = std::make_unique<PeerEventBridge>(Events, Objects, LocalObjectId, [this]() { return Now; },
+				                                          [&peer](Engine::NetworkEventKind kind) { peer.PublishEvent(kind); });
+			}
+
+			double Now;
+			Engine::EventManager Events;
+			Engine::GameObjectRegistry Objects;
+			Engine::ObjectId LocalObjectId = 0;
+			Engine::ObjectId RemoteObjectId = 0;
+			std::unique_ptr<PeerEventBridge> Bridge;
+		};
+
+		PeerClient peerA(1, 6261);
+		PeerClient peerB(2, 6262);
+		peerA.UpdatePeers({ MakePeer(2, 6262) });
+		peerB.UpdatePeers({ MakePeer(1, 6261) });
+		WarmUp(peerA, 1, peerB);
+
+		World worldA(1, 2, 1000.0, peerA); // very different logical clocks: nothing may depend on them matching
+		World worldB(2, 1, 5.0, peerB);
+
+		worldA.Events.Raise(Engine::DeathEventData{ worldA.LocalObjectId, Engine::NoObjectId });
+		worldA.Events.DispatchDue(); // A handles its own death; its bridge announces it
+
+		std::vector<Engine::NetworkEvent> received = CollectEvents(peerB, 1, PollTimeoutMs);
+		bool bridged = received.size() == 1 && worldB.Bridge->HandleNetworkEvent(received[0]);
+		Check(bridged, "EndToEnd_PeerBReceivesAndBridgesAsDeathOfItsRemoteObjectForA");
+		Check(!worldB.Bridge->IsMarkedDead(worldB.RemoteObjectId), "EndToEnd_NoReactionUntilBsEventManagerDispatches");
+		worldB.Events.DispatchDue();
+		Check(worldB.Bridge->IsMarkedDead(worldB.RemoteObjectId), "EndToEnd_BsRemotePlayerAIsVisiblyMarkedDead");
+		Check(!worldB.Bridge->IsMarkedDead(worldB.LocalObjectId), "EndToEnd_BsOwnPlayerIsNotMarked");
+		Check(!worldA.Bridge->IsMarkedDead(worldA.RemoteObjectId), "EndToEnd_AsView_OfB_IsUnaffected");
+
+		worldB.Now = 5.0 + PeerEventBridge::MarkDuration + 0.1; // B's own clock decides expiry
+		Check(!worldB.Bridge->IsMarkedDead(worldB.RemoteObjectId), "EndToEnd_MarkerExpiresOnBsLogicalClock");
+		Check(DrainFor(peerA, 200).empty(), "EndToEnd_AReceivesNoEchoOfItsOwnDeath");
 	}
 
 	std::printf("\n%s\n", g_Failures == 0 ? "All tests passed." : "Some tests FAILED.");

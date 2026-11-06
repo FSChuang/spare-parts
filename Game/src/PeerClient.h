@@ -1,10 +1,12 @@
 #pragma once
 
+#include "Engine/Network/EventProtocol.h"
 #include "Engine/Network/Protocol.h"
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -36,9 +38,30 @@
 //                          its own schedule.
 //   GetLatestPeerStates()  a copy of the latest state received from each remote peer,
 //                          keyed by PlayerId; no network I/O.
+//
+// Milestone 4 Checkpoint 3 — gameplay event notifications share this same PUB/SUB channel:
+//   PublishEvent()  appends to a FIFO outgoing queue; no network I/O.
+//   PollEvents()    drains a FIFO incoming queue of received notifications; no network I/O.
+// Player state and events are deliberately different kinds of data. State is latest-wins
+// (a single slot — only the newest position matters); events are discrete, so each gets its
+// own queue slot and none can overwrite another. The worker tells the two frame formats
+// apart by the leading byte alone (Engine::IsNetworkEventFrame) before decoding either, so
+// an event frame is never fed to the state decoder or vice versa. Only the worker thread
+// touches ZeroMQ, and PeerClient knows nothing about EventManager: the main thread polls
+// decoded notifications and is the only thread that ever raises them into one.
+//
+// DELIVERY IS NOT RELIABLE: PUB/SUB can silently lose a message (a subscription that has not
+// finished connecting, a full queue, a peer that just joined). That is acceptable here
+// because an event is a one-shot NOTIFICATION about something the owning client has already
+// handled authoritatively for itself — there is no ACK, retry or reconciliation, by design.
 class PeerClient
 {
 public:
+	// Upper bound on received-but-unpolled notifications (see PollEvents()). Generous for
+	// low-frequency gameplay events; exists only so a stalled main thread cannot grow it
+	// without limit.
+	static constexpr std::size_t MaxQueuedIncomingEvents = 256;
+
 	explicit PeerClient(Engine::PlayerId localPlayerId, std::uint16_t localP2pPort, std::string host = "127.0.0.1");
 	~PeerClient();
 
@@ -55,6 +78,17 @@ public:
 	// connects newly-desired peers and disconnects no-longer-desired ones; unchanged
 	// peers are left alone (never reconnected).
 	void UpdatePeers(const std::vector<Engine::PeerInfo>& peers);
+
+	// Queues a gameplay event notification about THIS client's player for every peer
+	// (FIFO; nothing is overwritten or coalesced) and wakes the worker. The wire frame's
+	// source id is always this client's own PlayerId — a caller cannot name another player.
+	void PublishEvent(Engine::NetworkEventKind kind);
+
+	// Returns, in arrival order, every event notification received since the last call, and
+	// clears them. Only notifications from currently-desired peers are kept (never our own,
+	// never a peer removed from the directory). If the main thread stops polling, the queue
+	// is capped (MaxQueuedIncomingEvents) and the OLDEST entries are discarded first.
+	std::vector<Engine::NetworkEvent> PollEvents();
 
 	// A copy of the latest state received from each remote peer, keyed by PlayerId.
 	// A peer removed via UpdatePeers() (and, before that, the local player's own id)
@@ -82,11 +116,13 @@ private:
 	std::condition_variable m_WorkerWakeCondition;
 	std::optional<Engine::PlayerState> m_PendingOutgoingState;
 	std::optional<std::vector<Engine::PeerInfo>> m_PendingPeers;
+	std::deque<Engine::NetworkEventKind> m_PendingOutgoingEvents;
 	bool m_StopRequested = false;
 
 	// --- incoming: written by the worker thread, read by the main thread ---
 	mutable std::mutex m_IncomingMutex;
 	std::unordered_map<Engine::PlayerId, Engine::PlayerState> m_LatestPeerStates;
+	std::deque<Engine::NetworkEvent> m_IncomingEvents;
 
 	// Test/debug instrumentation (see GetSentStateUpdateCount()).
 	std::atomic<std::uint64_t> m_SentStateUpdateCount{ 0 };

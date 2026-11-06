@@ -73,6 +73,23 @@ void PeerClient::UpdatePeers(const std::vector<Engine::PeerInfo>& peers)
 	m_WorkerWakeCondition.notify_one();
 }
 
+void PeerClient::PublishEvent(Engine::NetworkEventKind kind)
+{
+	{
+		std::lock_guard<std::mutex> lock(m_OutgoingMutex);
+		m_PendingOutgoingEvents.push_back(kind);
+	}
+	m_WorkerWakeCondition.notify_one();
+}
+
+std::vector<Engine::NetworkEvent> PeerClient::PollEvents()
+{
+	std::lock_guard<std::mutex> lock(m_IncomingMutex);
+	std::vector<Engine::NetworkEvent> events(m_IncomingEvents.begin(), m_IncomingEvents.end());
+	m_IncomingEvents.clear();
+	return events;
+}
+
 std::unordered_map<Engine::PlayerId, Engine::PlayerState> PeerClient::GetLatestPeerStates() const
 {
 	std::lock_guard<std::mutex> lock(m_IncomingMutex);
@@ -111,6 +128,7 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 	{
 		std::optional<Engine::PlayerState> stateToSend;
 		std::optional<std::vector<Engine::PeerInfo>> desiredPeers;
+		std::deque<Engine::NetworkEventKind> eventsToSend;
 		{
 			std::unique_lock<std::mutex> lock(m_OutgoingMutex);
 			// Bounded wait, never a blocking Receive(): wakes immediately on a new
@@ -120,13 +138,15 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 			m_WorkerWakeCondition.wait_for(lock, WorkerPollInterval,
 			                               [this]() {
 				                               return m_PendingOutgoingState.has_value() ||
-				                                      m_PendingPeers.has_value() || m_StopRequested;
+				                                      m_PendingPeers.has_value() ||
+				                                      !m_PendingOutgoingEvents.empty() || m_StopRequested;
 			                               });
 
 			stateToSend = std::move(m_PendingOutgoingState);
 			m_PendingOutgoingState.reset();
 			desiredPeers = std::move(m_PendingPeers);
 			m_PendingPeers.reset();
+			eventsToSend.swap(m_PendingOutgoingEvents);
 			stopRequested = m_StopRequested;
 		}
 		// Mutex released before any network I/O below — never hold a lock across
@@ -180,6 +200,14 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 				{
 					it = (desired.find(it->first) == desired.end()) ? m_LatestPeerStates.erase(it) : std::next(it);
 				}
+
+				// Same for notifications not yet polled: a removed peer's queued events are
+				// discarded rather than handed to the game after it has gone.
+				for (auto it = m_IncomingEvents.begin(); it != m_IncomingEvents.end();)
+				{
+					it = (desired.find(it->SourcePlayerId) == desired.end()) ? m_IncomingEvents.erase(it)
+					                                                         : std::next(it);
+				}
 			}
 		}
 
@@ -189,6 +217,14 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 			lastSentState = stateToSend;
 			pub.Send(ToFrame(Engine::EncodeStateUpdate(Engine::StateUpdate{ *stateToSend, false })));
 			m_SentStateUpdateCount.fetch_add(1, std::memory_order_relaxed);
+		}
+
+		// Event notifications go out in the order they were raised, after this tick's state
+		// (the two are independent streams on the one PUB socket). The source id is stamped
+		// here, on the worker, from the id this client was constructed with.
+		for (Engine::NetworkEventKind kind : eventsToSend)
+		{
+			pub.Send(ToFrame(Engine::EncodeNetworkEvent(Engine::NetworkEvent{ kind, localPlayerId })));
 		}
 
 		// Drain every currently-available peer message — TryReceive() never blocks, so
@@ -201,7 +237,29 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 				break;
 			}
 
-			std::optional<Engine::StateUpdate> update = Engine::DecodeStateUpdate(ToBytes(*frame));
+			std::vector<std::uint8_t> bytes = ToBytes(*frame);
+
+			// Multiplexing: the leading byte alone decides which decoder sees the frame, so an
+			// event frame is never handed to the state decoder (or the reverse).
+			if (Engine::IsNetworkEventFrame(bytes))
+			{
+				std::optional<Engine::NetworkEvent> event = Engine::DecodeNetworkEvent(bytes);
+				if (!event.has_value() || event->SourcePlayerId == localPlayerId ||
+				    connectedPeers.find(event->SourcePlayerId) == connectedPeers.end())
+				{
+					continue; // malformed, our own broadcast, or not a currently-desired peer
+				}
+
+				std::lock_guard<std::mutex> lock(m_IncomingMutex);
+				m_IncomingEvents.push_back(*event);
+				if (m_IncomingEvents.size() > MaxQueuedIncomingEvents)
+				{
+					m_IncomingEvents.pop_front();
+				}
+				continue;
+			}
+
+			std::optional<Engine::StateUpdate> update = Engine::DecodeStateUpdate(bytes);
 			if (!update.has_value())
 			{
 				continue; // malformed: ignore, never crash

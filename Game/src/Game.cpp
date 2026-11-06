@@ -106,6 +106,10 @@ namespace
 	// never used to identify a player (that's always the server-assigned PlayerId).
 	constexpr Engine::Color RemotePlayerColor{ 255, 190, 0, 255 };
 
+	// A remote player is drawn in this color while its "recently died" marker is active
+	// (Milestone 4 networked Death event) — purely presentational, never networked.
+	constexpr Engine::Color RemotePlayerDeadColor{ 255, 255, 255, 255 };
+
 	// Local-player sentinel network id before NetworkClient's handshake has assigned a
 	// real one (Engine::Network/Protocol.h: PlayerId 0 is reserved "unassigned"). The
 	// local player GameObject always has a network-id property, even before a real id is
@@ -154,6 +158,19 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 	// still resolves via the not-yet-assigned PlayerId here; that pre-existing behavior is
 	// deliberately unchanged.
 	m_LocalPlayer->RequestSpawn(m_Objects.Find(m_LocalPlayerObjectId)->GetPosition());
+
+	// The local player's own Death events are announced to peers through m_PeerClient, which
+	// only exists once the server handshake has completed — before that there is nobody to
+	// tell. (PublishEvent just queues; the PeerClient worker does the sending.)
+	m_PeerEvents = std::make_unique<PeerEventBridge>(
+	    m_Events, m_Objects, m_LocalPlayerObjectId, std::move(timeSource),
+	    [this](Engine::NetworkEventKind kind)
+	    {
+		    if (m_PeerClient)
+		    {
+			    m_PeerClient->PublishEvent(kind);
+		    }
+	    });
 }
 
 void Game::CreateMovingPlatforms()
@@ -277,6 +294,10 @@ void Game::Render(Engine::Renderer& renderer)
 
 		Engine::GameObject view = object;
 		view.SetPosition({ object.GetPosition().X - cameraOffsetX, object.GetPosition().Y });
+		if (m_PeerEvents->IsMarkedDead(id))
+		{
+			view.SetRender(RemotePlayerDeadColor);
+		}
 		renderer.DrawObject(view);
 	}
 }
@@ -348,6 +369,20 @@ void Game::UpdateNetworking(float deltaTime)
 			m_PeerClient = std::make_unique<PeerClient>(localId, localP2pPort);
 		}
 	}
+
+	// Milestone 4 Checkpoint 3: received peer event notifications. Drained here on the main
+	// thread (PeerClient's worker only queues them) and raised into m_Events, which stamps
+	// them with THIS client's logical time; they are dispatched at the start of the next
+	// Update(). Remote objects used to resolve them are the ones applied by earlier frames
+	// below, so a notification that beats its sender's first state is simply ignored.
+	if (m_PeerClient)
+	{
+		for (const Engine::NetworkEvent& networkEvent : m_PeerClient->PollEvents())
+		{
+			m_PeerEvents->HandleNetworkEvent(networkEvent);
+		}
+	}
+	m_PeerEvents->PruneMarkers();
 
 	// The local player's network-relevant state, extracted from its GameObject through
 	// the explicit Milestone 3 boundary (see NetworkState.h) rather than built from a

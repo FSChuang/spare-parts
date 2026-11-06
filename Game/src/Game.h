@@ -9,6 +9,7 @@
 #include "LocalPlayerController.h"
 #include "NetworkClient.h"
 #include "PeerClient.h"
+#include "PeerEventBridge.h"
 
 #include <chrono>
 #include <functional>
@@ -178,4 +179,11 @@ private:
 	// handlers while m_Events is still alive. Also owns the presentational camera offset
 	// (client-local, never networked, never read by physics/collision — see above).
 	std::unique_ptr<LocalPlayerController> m_LocalPlayer;
+
+	// Milestone 4 Checkpoint 3: gameplay event notifications between peers. Announces this
+	// client's own deaths through m_PeerClient and turns peers' received death notifications
+	// into local events plus a temporary visible marker on that remote player (see
+	// PeerEventBridge.h). Declared last for the same reason as m_LocalPlayer: its Death
+	// subscription must be released while m_Events is still alive.
+	std::unique_ptr<PeerEventBridge> m_PeerEvents;
 };
