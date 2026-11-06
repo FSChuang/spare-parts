@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -112,8 +113,9 @@ namespace
 	constexpr std::uint32_t UnassignedNetworkId = 0;
 }
 
-Game::Game(const std::string& serverEndpoint)
-	: m_Physics(Gravity),
+Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource)
+	: m_Events(std::move(timeSource)),
+	  m_Physics(Gravity),
 	  m_EnemyPatrolDirection(1.0f),
 	  m_Network(serverEndpoint),
 	  // Set in the past by exactly one interval, so the very first Update() call
@@ -138,6 +140,20 @@ Game::Game(const std::string& serverEndpoint)
 	    m_Objects.Create(Engine::ObjectType::Generic, { EnemyPatrolLeftBound, EnemyPatrolY }, EnemySize);
 	enemy.SetRender(EnemyColor);
 	m_EnemyObjectId = enemy.GetId();
+
+	SubscribeEventLogging();
+
+	m_LocalPlayer = std::make_unique<LocalPlayerController>(
+	    m_Events, m_Objects, LocalPlayerObjects{ m_LocalPlayerObjectId, m_EnemyObjectId, m_DeathZoneObjectId },
+	    LocalPlayerConfig{ PlayerSpeed, JumpSpeed, ViewWidth }, [this] { return SelectSpawnPosition(); });
+
+	// The initial spawn also goes through the event system: the player object is created at
+	// its designated position above (a GameObject has to exist before an event can name it),
+	// and this Spawn event — handled in the first Update()'s input phase — is what formally
+	// spawns it (zero velocity, not grounded, camera on the spawn's screen). SelectSpawnPosition()
+	// still resolves via the not-yet-assigned PlayerId here; that pre-existing behavior is
+	// deliberately unchanged.
+	m_LocalPlayer->RequestSpawn(m_Objects.Find(m_LocalPlayerObjectId)->GetPosition());
 }
 
 void Game::CreateMovingPlatforms()
@@ -206,19 +222,40 @@ Engine::Vector2 Game::SelectSpawnPosition() const
 
 void Game::Update(Engine::InputManager& input, float deltaTime)
 {
-	UpdatePlayerMovement(input);
+	// Frame order, with two deliberate event-dispatch phases:
+	//
+	//  1. BeginFrame        allow a new death this frame
+	//  2. PollInputEvents   held-key CHANGES and fresh jump presses become Input events
+	//  3. DispatchDue #1    input effects apply BEFORE physics (move intent, jump impulse);
+	//                       also delivers the initial Spawn on the first frame
+	//  4. ApplyHorizontalMovement + physics integration (direct, not events)
+	//  5. enemy patrol      direct local simulation, before the hazard test so the player
+	//                       is tested against the enemy's position this frame
+	//  6. landing + hazard detection (direct geometry); a NEW landing, or touching the death
+	//                       zone / enemy, raises a Collision event
+	//  7. DispatchDue #2    the whole chain runs now, in one call: Collision -> (Death ->
+	//                       Spawn). A death never waits for the next frame, and the
+	//                       respawned position/camera are final before networking reads them
+	//  8. scrolling         camera snap on boundary contact (direct presentation math)
+	//  9. networking        publishes this frame's final player state
+	m_LocalPlayer->BeginFrame();
+
+	PollInputEvents(input);
+	m_Events.DispatchDue();
+
+	m_LocalPlayer->ApplyHorizontalMovement();
 	m_Physics.Update(*m_Objects.Find(m_LocalPlayerObjectId), deltaTime);
-	ResolvePlatformLanding();
-	ResolveDeathZone();
 
 	UpdateEnemyPatrol(deltaTime);
-	ResolveEnemyCollision();
+
+	m_LocalPlayer->ResolvePlatformLanding();
+	m_LocalPlayer->DetectHazardCollisions();
+	m_Events.DispatchDue();
 
 	UpdateScrolling();
 
 	// Networking runs last so it always publishes this frame's final player state —
-	// never a stale pre-respawn position, whether the respawn just happened above from
-	// entering the death zone or from the enemy collision check right before this call.
+	// never a stale pre-respawn position.
 	UpdateNetworking(deltaTime);
 }
 
@@ -227,9 +264,10 @@ void Game::Render(Engine::Renderer& renderer)
 	// Every object draws itself (or doesn't): Engine::Renderer::DrawObject silently skips
 	// any object with no render property (spawn points, the death zone, the boundary),
 	// so no special case is needed here for them. Each visible object is drawn from a
-	// COPY translated by -m_CameraOffsetX — the registry's own world-coordinate
+	// COPY translated by -the camera offset — the registry's own world-coordinate
 	// GameObjects (what physics/collision/networking operate on) are never modified for
 	// presentation purposes.
+	const float cameraOffsetX = m_LocalPlayer->CameraOffsetX();
 	for (auto& [id, object] : m_Objects)
 	{
 		if (!object.HasRender())
@@ -238,43 +276,23 @@ void Game::Render(Engine::Renderer& renderer)
 		}
 
 		Engine::GameObject view = object;
-		view.SetPosition({ object.GetPosition().X - m_CameraOffsetX, object.GetPosition().Y });
+		view.SetPosition({ object.GetPosition().X - cameraOffsetX, object.GetPosition().Y });
 		renderer.DrawObject(view);
 	}
 }
 
-void Game::UpdatePlayerMovement(Engine::InputManager& input)
+void Game::PollInputEvents(Engine::InputManager& input)
 {
-	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
-	Engine::Vector2 velocity = player.GetVelocity();
-
 	bool movingLeft = input.IsKeyPressed(SDL_SCANCODE_A) || input.IsKeyPressed(SDL_SCANCODE_LEFT);
 	bool movingRight = input.IsKeyPressed(SDL_SCANCODE_D) || input.IsKeyPressed(SDL_SCANCODE_RIGHT);
 
-	if (movingLeft && !movingRight)
-	{
-		velocity.X = -PlayerSpeed;
-	}
-	else if (movingRight && !movingLeft)
-	{
-		velocity.X = PlayerSpeed;
-	}
-	else
-	{
-		velocity.X = 0.0f;
-	}
-
-	// Edge-triggered (IsKeyJustPressed, not IsKeyPressed) and gated on m_IsGrounded (set
-	// by the END of the PREVIOUS frame's ResolvePlatformLanding()) — holding the key
-	// down never queues repeated jumps, and there is no mid-air jump at all.
+	// Jump is edge-triggered (IsKeyJustPressed, not IsKeyPressed): holding the key never
+	// queues repeated jumps. Whether the jump actually happens (grounded only) is decided by
+	// the Jump event's handler.
 	bool jumpPressed = input.IsKeyJustPressed(SDL_SCANCODE_SPACE) || input.IsKeyJustPressed(SDL_SCANCODE_W) ||
 	                    input.IsKeyJustPressed(SDL_SCANCODE_UP);
-	if (jumpPressed && m_IsGrounded)
-	{
-		velocity.Y = -JumpSpeed;
-	}
 
-	player.SetVelocity(velocity);
+	m_LocalPlayer->RaiseInputEvents(movingLeft, movingRight, jumpPressed);
 }
 
 void Game::UpdateEnemyPatrol(float deltaTime)
@@ -296,85 +314,6 @@ void Game::UpdateEnemyPatrol(float deltaTime)
 	}
 }
 
-void Game::ResolvePlatformLanding()
-{
-	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
-	Engine::Vector2 velocity = player.GetVelocity();
-
-	m_IsGrounded = false;
-
-	// Landing (and therefore becoming grounded) only ever happens while falling. Moving
-	// upward (e.g. the frame right after a jump) never resolves as a landing — same
-	// behavior as the original single-platform logic, just generalized to check every
-	// Platform-typed object instead of exactly one.
-	if (velocity.Y <= 0.0f)
-	{
-		return;
-	}
-
-	for (auto& [id, object] : m_Objects)
-	{
-		if (object.GetType() != Engine::ObjectType::Platform || !Engine::IsColliding(player, object))
-		{
-			continue;
-		}
-
-		Engine::Vector2 position = player.GetPosition();
-		position.Y = object.GetPosition().Y - player.GetSize().Y;
-		player.SetPosition(position);
-
-		velocity.Y = 0.0f;
-		player.SetVelocity(velocity);
-		m_IsGrounded = true;
-		// Lands on the first colliding platform found; with no overlapping platforms by
-		// design, this is deterministic. Milestone 3 deliberately does not implement
-		// moving-platform carrying (horizontal attachment) — the original single-platform
-		// behavior never did either.
-		break;
-	}
-}
-
-void Game::ResolveDeathZone()
-{
-	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
-	Engine::GameObject& deathZone = *m_Objects.Find(m_DeathZoneObjectId);
-
-	if (Engine::IsColliding(player, deathZone))
-	{
-		RespawnPlayer();
-	}
-}
-
-void Game::ResolveEnemyCollision()
-{
-	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
-	Engine::GameObject& enemy = *m_Objects.Find(m_EnemyObjectId);
-
-	if (!Engine::IsColliding(player, enemy))
-	{
-		return;
-	}
-
-	RespawnPlayer();
-}
-
-void Game::RespawnPlayer()
-{
-	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
-	Engine::Vector2 spawnPosition = SelectSpawnPosition();
-	player.SetPosition(spawnPosition);
-	player.SetVelocity({ 0.0f, 0.0f });
-	m_IsGrounded = false;
-
-	// Bugfix checkpoint: UpdateScrolling() only updates the camera while the player is
-	// touching the boundary, which a freshly-respawned player is not — without this, a
-	// player who died on screen 2 but spawns on screen 1 (or vice versa) would be placed
-	// at the correct WORLD position but rendered far off the still-screen-2 view,
-	// looking exactly like "the player did not respawn." Snap the camera to the spawn's
-	// own screen immediately instead.
-	m_CameraOffsetX = CameraOffsetForWorldX(spawnPosition.X, ViewWidth);
-}
-
 void Game::UpdateScrolling()
 {
 	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
@@ -385,7 +324,8 @@ void Game::UpdateScrolling()
 		return;
 	}
 
-	m_CameraOffsetX = NextCameraOffsetX(m_CameraOffsetX, player.GetVelocity().X, ViewWidth);
+	m_LocalPlayer->SetCameraOffsetX(
+	    NextCameraOffsetX(m_LocalPlayer->CameraOffsetX(), player.GetVelocity().X, ViewWidth));
 }
 
 void Game::UpdateNetworking(float deltaTime)
@@ -545,5 +485,53 @@ void Game::UpdateNetworking(float deltaTime)
 		{
 			ApplyPlayerState(*remotePlayer, state);
 		}
+	}
+}
+
+void Game::SubscribeEventLogging()
+{
+	// One concise line per event, so a manual run can show all four required event types
+	// firing. Input and Collision are transition-only (not per-frame), and Death/Spawn are
+	// rare, so this never floods the console. Gameplay does not depend on any of it.
+	auto logEvent = [](const Engine::Event& event)
+	{
+		std::printf("[Event t=%.2f] ", event.Timestamp);
+		switch (event.Type)
+		{
+		case Engine::EventType::Input:
+		{
+			const auto& input = std::get<Engine::InputEventData>(event.Payload);
+			const char* action = input.Action == Engine::InputAction::MoveLeft    ? "MoveLeft"
+			                     : input.Action == Engine::InputAction::MoveRight ? "MoveRight"
+			                                                                      : "Jump";
+			std::printf("Input %s %s\n", action, input.Pressed ? "pressed" : "released");
+			break;
+		}
+		case Engine::EventType::Collision:
+		{
+			const auto& collision = std::get<Engine::CollisionEventData>(event.Payload);
+			std::printf("Collision object %u with object %u\n", collision.A, collision.B);
+			break;
+		}
+		case Engine::EventType::Death:
+		{
+			const auto& death = std::get<Engine::DeathEventData>(event.Payload);
+			std::printf("Death object %u (cause object %u)\n", death.Subject, death.Cause);
+			break;
+		}
+		case Engine::EventType::Spawn:
+		{
+			const auto& spawn = std::get<Engine::SpawnEventData>(event.Payload);
+			std::printf("Spawn object %u at (%.0f, %.0f)\n", spawn.Subject, spawn.Position.X, spawn.Position.Y);
+			break;
+		}
+		}
+		std::fflush(stdout);
+	};
+
+	for (Engine::EventType type : { Engine::EventType::Input, Engine::EventType::Collision,
+	                                 Engine::EventType::Death, Engine::EventType::Spawn })
+	{
+		m_EventLogSubscriptions.emplace_back(m_Events, type, logEvent);
 	}
 }

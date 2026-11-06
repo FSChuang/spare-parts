@@ -1,16 +1,20 @@
 #pragma once
 
+#include "Engine/Event/EventManager.h"
 #include "Engine/GameObject/GameObject.h"
 #include "Engine/GameObject/GameObjectRegistry.h"
 #include "Engine/Network/Protocol.h"
 #include "Engine/Physics/PhysicsSystem.h"
 
+#include "LocalPlayerController.h"
 #include "NetworkClient.h"
 #include "PeerClient.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace Engine
 {
@@ -35,21 +39,20 @@ namespace Engine
 // iteration order or array index.
 //
 // Side-scrolling (Milestone 3): the world is two 1920-wide screens placed side by side
-// (world X 0-3840). m_CameraOffsetX is a purely PRESENTATIONAL client-local value — it is
-// never written to any GameObject's actual position, never sent over the network, and
+// (world X 0-3840). The camera offset (m_LocalPlayer->CameraOffsetX()) is a purely
+// PRESENTATIONAL client-local value — it is never written to any GameObject's actual position, never sent over the network, and
 // never read by physics/collision. Crossing the hidden Boundary GameObject (built once,
-// at the world-space screen seam, world X ~1920) snaps m_CameraOffsetX between 0 and
+// at the world-space screen seam, world X ~1920) snaps the camera offset between 0 and
 // 1920 depending on the player's direction of travel. Render() is the only place
-// m_CameraOffsetX is consulted: it draws a COPY of each object translated left by the
+// the camera offset is consulted: it draws a COPY of each object translated left by the
 // offset, leaving the registry's own world-coordinate GameObjects untouched — exactly
 // the `renderX = worldX - cameraOffsetX` split that keeps physics/collision/networking
 // entirely in shared world coordinates regardless of which screen is currently in view.
 //
-// Grounded/jump (Milestone 3): m_IsGrounded reflects whether the player was resolved as
-// resting on a platform as of the END of the PREVIOUS frame's ResolvePlatformLanding()
-// call; UpdatePlayerMovement() reads it at the START of the current frame to decide
-// whether a jump is allowed. This one-frame lag is the standard, imperceptible way to
-// answer "is the player currently grounded" without needing a lookahead.
+// Grounded/jump (Milestone 3, event-driven in Milestone 4): the player's grounded state is
+// granted by the Collision event raised on a NEW landing and cleared by a jump, by leaving
+// the platform, or by a spawn; a Jump input event reads it to decide whether the jump is
+// allowed. See LocalPlayerController.h.
 //
 // Milestone 2 Section 2: the local player is still fully client-simulated (input,
 // physics, collisions), unchanged. Remote players are visual replicas only — no local
@@ -80,17 +83,22 @@ namespace Engine
 // cadence for the server session (membership/platform/peer-directory freshness,
 // independent of Timeline scale or pause) — see UpdateNetworking().
 //
-// Falling into the death zone, and colliding with the enemy, both respawn the player via
-// the same centralized RespawnPlayer() helper — see ResolveDeathZone()/
-// ResolveEnemyCollision(). RespawnPlayer() always clears velocity, clears m_IsGrounded,
-// and snaps m_CameraOffsetX to the spawn position's own screen (UpdateScrolling() only
-// updates the camera on boundary contact, which a freshly-respawned player never has) —
-// it never touches the player GameObject's network identity, so remote peers simply
-// observe the next published position normally.
+// Milestone 4 (Event Management System): the local player's gameplay flows through one
+// Engine::EventManager owned by Game (m_Events). Input (MoveLeft/MoveRight/Jump), Collision
+// (landing, death zone, enemy), Death and Spawn are real events whose handlers apply the
+// gameplay consequences — see LocalPlayerController.h for the event chain. Falling into the
+// death zone, or touching the enemy, raises Collision -> Death -> Spawn; the Spawn handler
+// is the single place a respawn takes effect (position, velocity, grounded, camera) and
+// never touches the player GameObject's network identity, so remote peers simply observe the
+// next published position normally. Update() runs two deliberate dispatch phases — see its
+// definition for the exact frame order.
+//
 class Game
 {
 public:
-	explicit Game(const std::string& serverEndpoint);
+	/// `timeSource` supplies the logical time that stamps every event — main.cpp wires it to
+	/// the game Timeline's GetTime(), so a paused Timeline freezes future-scheduled events.
+	Game(const std::string& serverEndpoint, std::function<double()> timeSource);
 
 	void Update(Engine::InputManager& input, float deltaTime);
 	void Render(Engine::Renderer& renderer);
@@ -104,13 +112,13 @@ private:
 	void CreateDeathZones();
 	void CreateBoundaries();
 
-	void UpdatePlayerMovement(Engine::InputManager& input);
+	// Reads the keyboard and hands the local player controller this frame's input.
+	void PollInputEvents(Engine::InputManager& input);
 	void UpdateEnemyPatrol(float deltaTime);
-	void ResolvePlatformLanding();
-	void ResolveDeathZone();
-	void ResolveEnemyCollision();
-	void RespawnPlayer();
 	void UpdateScrolling();
+	// Registers a concise stdout line for each of the four event types (manual-run
+	// visibility only; no gameplay depends on it).
+	void SubscribeEventLogging();
 	void UpdateNetworking(float deltaTime);
 
 	// Picks this local player's designated spawn position: a deterministic function of
@@ -118,6 +126,12 @@ private:
 	// point), so different players spawn at different points without any server
 	// involvement — spawn points are deterministic, identical, client-local scene setup.
 	Engine::Vector2 SelectSpawnPosition() const;
+
+	// Declared before everything that registers handlers on it, so it is destroyed AFTER
+	// them (members are destroyed in reverse declaration order): ScopedSubscriptions must
+	// never outlive their EventManager.
+	Engine::EventManager m_Events;
+	std::vector<Engine::ScopedSubscription> m_EventLogSubscriptions;
 
 	// Every GameObject this client knows about: both moving platforms, all three static
 	// platforms, the local player, the enemy, every spawn point, the death zone, the
@@ -133,17 +147,6 @@ private:
 
 	Engine::PhysicsSystem m_Physics;
 	float m_EnemyPatrolDirection;
-
-	// True if ResolvePlatformLanding() resolved the player as resting on a platform as
-	// of the end of the most recently completed Update() call. Read by
-	// UpdatePlayerMovement() at the start of the NEXT frame to gate jumping — see the
-	// class comment above for why this one-frame lag is fine.
-	bool m_IsGrounded = false;
-
-	// Milestone 3 side-scrolling: purely presentational, client-local camera translation
-	// in world-space pixels. Never written to any GameObject, never networked, never
-	// read by physics/collision — see the class comment above.
-	float m_CameraOffsetX = 0.0f;
 
 	// Destruction order matters here (members are destroyed in reverse declaration
 	// order): m_PeerClient is declared AFTER m_Network, so it is destroyed BEFORE it —
@@ -168,4 +171,11 @@ private:
 	// keeps happening at a fixed cadence even while Timeline is paused or scaled. See
 	// UpdateNetworking() for the exact scheme.
 	std::chrono::steady_clock::time_point m_LastServerRefreshTime;
+
+	// The local player's event-driven gameplay (input intent, landing, hazards, death,
+	// respawn, camera offset). Constructed in the constructor body once the player, enemy
+	// and death-zone objects exist; declared LAST so it is destroyed FIRST, unsubscribing its
+	// handlers while m_Events is still alive. Also owns the presentational camera offset
+	// (client-local, never networked, never read by physics/collision — see above).
+	std::unique_ptr<LocalPlayerController> m_LocalPlayer;
 };

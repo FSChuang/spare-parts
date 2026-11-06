@@ -10,6 +10,7 @@ find_package(Threads REQUIRED)
 add_executable(main
     src/Game.cpp
     src/GameRules.cpp
+    src/LocalPlayerController.cpp
     src/NetworkClient.cpp
     src/NetworkState.cpp
     src/PeerClient.cpp
@@ -58,6 +59,17 @@ add_executable(DeathZoneGeometryTest
     src/DeathZoneGeometryTest.cpp
 )
 target_link_libraries(DeathZoneGeometryTest PRIVATE EngineCore)
+
+# Milestone 4 Checkpoint 2: the local player's event-driven gameplay (Input/Collision/Death/
+# Spawn chain, death dedupe, spawn reset) exercised through the real LocalPlayerController,
+# a real Engine::EventManager (with a fake clock) and real GameObjects. EngineCore only — no
+# SDL, no sockets, no running server.
+add_executable(LocalPlayerControllerTest
+    src/LocalPlayerController.cpp
+    src/GameRules.cpp
+    src/LocalPlayerControllerTest.cpp
+)
+target_link_libraries(LocalPlayerControllerTest PRIVATE EngineCore)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't

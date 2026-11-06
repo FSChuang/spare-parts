@@ -24,7 +24,9 @@ int main(int argc, char* argv[])
 	Engine::WindowConfig windowConfig{ WindowTitle, WindowWidth, WindowHeight };
 	Engine::Application application(windowConfig);
 
-	Game game(serverEndpoint);
+	// Every gameplay event is stamped with the game Timeline's logical time, so pausing or
+	// scaling the Timeline (P, 1/2/3) affects event timing exactly as it affects physics.
+	Game game(serverEndpoint, [&application] { return application.GetGameTimeline().GetTime(); });
 
 	application.Run(
 	    [&game](Engine::InputManager& input, float deltaTime) { game.Update(input, deltaTime); },
