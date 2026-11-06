@@ -78,9 +78,15 @@ namespace
 	// Spans the full world width, well below the playable area — falling past the bottom
 	// of any platform eventually collides with this instead of a raw "if y > threshold"
 	// check (Milestone 3: formalizes the old Milestone 2 fall-off rule as a real,
-	// collidable GameObject).
+	// collidable GameObject). Bugfix checkpoint: made effectively bottomless (was 400px
+	// deep) so a single abnormally large physics step — gravity has no velocity cap, and
+	// a slow frame (e.g. four GUI client windows competing for CPU) can produce a large
+	// deltaTime — cannot tunnel the player all the way through a merely-400px-deep zone
+	// and fall forever, invisible, with no collision ever firing again. Still an ordinary
+	// bounded AABB GameObject tested by the same Engine::IsColliding as everything else —
+	// no new death rule, no raw y-threshold check.
 	constexpr Engine::Vector2 DeathZonePosition{ 0.0f, WorldHeight };
-	constexpr Engine::Vector2 DeathZoneSize{ WorldWidth, 400.0f };
+	constexpr Engine::Vector2 DeathZoneSize{ WorldWidth, 1000000.0f };
 
 	// A thin vertical strip at the world-space seam between the two screens. Crossing it
 	// snaps the presentational camera offset between the two screens — see
@@ -355,9 +361,18 @@ void Game::ResolveEnemyCollision()
 void Game::RespawnPlayer()
 {
 	Engine::GameObject& player = *m_Objects.Find(m_LocalPlayerObjectId);
-	player.SetPosition(SelectSpawnPosition());
+	Engine::Vector2 spawnPosition = SelectSpawnPosition();
+	player.SetPosition(spawnPosition);
 	player.SetVelocity({ 0.0f, 0.0f });
 	m_IsGrounded = false;
+
+	// Bugfix checkpoint: UpdateScrolling() only updates the camera while the player is
+	// touching the boundary, which a freshly-respawned player is not — without this, a
+	// player who died on screen 2 but spawns on screen 1 (or vice versa) would be placed
+	// at the correct WORLD position but rendered far off the still-screen-2 view,
+	// looking exactly like "the player did not respawn." Snap the camera to the spawn's
+	// own screen immediately instead.
+	m_CameraOffsetX = CameraOffsetForWorldX(spawnPosition.X, ViewWidth);
 }
 
 void Game::UpdateScrolling()

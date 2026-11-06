@@ -51,6 +51,14 @@ add_executable(GameRulesTest
     src/GameRulesTest.cpp
 )
 
+# Bugfix checkpoint: death-zone GEOMETRY regression tests (including the tunneling case)
+# using the real Engine::GameObject + Engine::IsColliding mechanism. Links EngineCore
+# only — no SDL, no sockets, no running server.
+add_executable(DeathZoneGeometryTest
+    src/DeathZoneGeometryTest.cpp
+)
+target_link_libraries(DeathZoneGeometryTest PRIVATE EngineCore)
+
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't
 # CTest-registered). Requires a real `server` already running at its endpoint.

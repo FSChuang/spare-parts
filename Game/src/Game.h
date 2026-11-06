@@ -82,9 +82,11 @@ namespace Engine
 //
 // Falling into the death zone, and colliding with the enemy, both respawn the player via
 // the same centralized RespawnPlayer() helper — see ResolveDeathZone()/
-// ResolveEnemyCollision(). RespawnPlayer() always clears velocity and never touches the
-// player GameObject's network identity, so remote peers simply observe the next
-// published position normally.
+// ResolveEnemyCollision(). RespawnPlayer() always clears velocity, clears m_IsGrounded,
+// and snaps m_CameraOffsetX to the spawn position's own screen (UpdateScrolling() only
+// updates the camera on boundary contact, which a freshly-respawned player never has) —
+// it never touches the player GameObject's network identity, so remote peers simply
+// observe the next published position normally.
 class Game
 {
 public:

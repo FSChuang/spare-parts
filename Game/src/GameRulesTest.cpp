@@ -50,6 +50,20 @@ int main()
 	Check(NextCameraOffsetX(1920.0f, 0.0f, 1920.0f) == 1920.0f,
 	      "NextCameraOffsetX_Stationary_LeavesSecondScreenOffsetUnchanged");
 
+	// --- CameraOffsetForWorldX (bugfix checkpoint: camera must follow a respawn to the
+	// spawn's own screen, since UpdateScrolling() only fires on boundary contact) ---
+
+	Check(CameraOffsetForWorldX(80.0f, 1920.0f) == 0.0f, "CameraOffsetForWorldX_Screen0Position_ReturnsZero");
+	Check(CameraOffsetForWorldX(2150.0f, 1920.0f) == 1920.0f,
+	      "CameraOffsetForWorldX_Screen1Position_ReturnsViewWidth");
+	Check(CameraOffsetForWorldX(1920.0f, 1920.0f) == 1920.0f, "CameraOffsetForWorldX_ExactlyAtSeam_CountsAsScreen1");
+
+	// The actual bug scenario: camera already on screen 2 (offset == viewWidth), player
+	// respawns at a screen-0 spawn point — the camera must be told to follow regardless
+	// of where it was before, not just when the player crosses the boundary.
+	Check(CameraOffsetForWorldX(80.0f, 1920.0f) != 1920.0f,
+	      "CameraOffsetForWorldX_RespawnOnScreen0WhileCameraWasOnScreen2_ReturnsScreen0Offset");
+
 	std::printf("\n%s\n", g_Failures == 0 ? "All tests passed." : "Some tests FAILED.");
 	return g_Failures == 0 ? 0 : 1;
 }

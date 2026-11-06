@@ -19,3 +19,8 @@ float NextCameraOffsetX(float currentOffsetX, float playerVelocityX, float viewW
 
 	return currentOffsetX;
 }
+
+float CameraOffsetForWorldX(float worldX, float viewWidth)
+{
+	return worldX >= viewWidth ? viewWidth : 0.0f;
+}

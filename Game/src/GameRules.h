@@ -18,3 +18,11 @@ std::size_t SelectSpawnIndex(std::uint32_t playerId, std::size_t spawnCount);
 /// screen, moving left snaps back to the first; standing still on the boundary
 /// (velocity == 0) leaves the current offset unchanged, avoiding flicker.
 float NextCameraOffsetX(float currentOffsetX, float playerVelocityX, float viewWidth);
+
+/// Bugfix checkpoint: the camera offset appropriate for a player standing at a given
+/// world X position, regardless of where the camera was before — used by RespawnPlayer()
+/// to snap the camera to the spawn's own screen immediately, rather than leaving it on
+/// whichever screen the player died on (UpdateScrolling() only updates the camera while
+/// the player is touching the boundary, which a freshly-respawned player is not). Screen
+/// 0 is [0, viewWidth), screen 1 is [viewWidth, 2*viewWidth).
+float CameraOffsetForWorldX(float worldX, float viewWidth);
