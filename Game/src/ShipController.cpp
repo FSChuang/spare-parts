@@ -102,6 +102,11 @@ void ShipController::DetectBulletHits()
 	}
 }
 
+void ShipController::SetShotListener(ShotListener listener)
+{
+	m_ShotListener = std::move(listener);
+}
+
 void ShipController::RequestSpawn(Engine::Vector2 centre)
 {
 	m_Events.Raise(Engine::SpawnEventData{ m_ShipId, centre }, SpawnEventPriority);
@@ -167,6 +172,11 @@ void ShipController::TryFire()
 	Engine::Vector2 muzzle{ centre.X + forward.X * m_Config.MuzzleDistance,
 		                    centre.Y + forward.Y * m_Config.MuzzleDistance };
 	m_Bullets.Fire(muzzle, m_State.HeadingRadians, m_ShipId);
+
+	if (m_ShotListener)
+	{
+		m_ShotListener(muzzle, m_State.HeadingRadians);
+	}
 }
 
 void ShipController::OnCollision(const Engine::CollisionEventData& collision)

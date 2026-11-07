@@ -29,8 +29,7 @@ namespace Engine
 // rotate left/right and shoot bullets, wrap around the arena edges, die when hit, and respawn
 // after a delay with a short invulnerability window. Rendering is primitives only for now.
 //
-// Controls: A/Left rotate left, D/Right rotate right, Space fire, K (temporary dev aid) drop
-// a hostile bullet on yourself to see the death/respawn chain while nobody else can shoot you.
+// Controls: A/Left rotate left, D/Right rotate right, Space fire.
 //
 // Every object is a plain Engine::GameObject in one registry (m_Objects): the local ship, every
 // remote ship, every bullet. Ship-specific state (heading, alive, cooldown, invulnerability) is
@@ -40,12 +39,16 @@ namespace Engine
 // The local ship is fully client-simulated and gameplay flows through one Engine::EventManager
 // (m_Events): Input -> (Collision -> Death ->) Spawn, see ShipController.h.
 //
-// NETWORKING is the Milestone 2/4 design, unchanged in this checkpoint: server membership via
-// NetworkClient, remote ship position/velocity exclusively from PeerClient (peer-to-peer),
-// created lazily once the handshake completes. The wire carries no heading: a remote ship's
-// heading is derived from its velocity direction (it flies at constant speed). Bullets are NOT
-// networked yet, so a ship cannot yet be shot by a remote player — that is the next checkpoint
-// — and a remote death is shown by PeerEventBridge's temporary marker.
+// NETWORKING: server membership via NetworkClient, remote ship position/velocity exclusively from
+// PeerClient (peer-to-peer), created lazily once the handshake completes. The wire carries no
+// heading: a remote ship's heading is derived from its velocity direction (it flies at constant
+// speed). COMBAT is peer-authoritative: each client alone decides whether ITS ship was hit. A
+// fired bullet is announced as a Shoot (origin + heading); every other client rebuilds it from
+// that and its own shared constants, and a rebuilt bullet that reaches a client's own ship raises
+// that client's own Collision -> Death, announced as Death and later Spawn. Nobody ever declares
+// another player dead; a bullet of mine touching a remote ship's picture does nothing. A remote
+// ship is shown alive until its Death arrives and hidden (after a brief marker) until its Spawn.
+// See PeerEventBridge.h.
 //
 // REPLAY (F5/F6/F7) is switched off in this checkpoint: the old replay samples described a
 // platformer (camera, platforms, enemy). The Engine's ReplayRecorder and the replay control

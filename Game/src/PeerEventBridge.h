@@ -4,88 +4,111 @@
 #include "Engine/GameObject/GameObjectRegistry.h"
 #include "Engine/Network/EventProtocol.h"
 
+#include "BulletField.h"
+
 #include <functional>
 #include <unordered_map>
 
-// Milestone 4 Checkpoint 3: the explicit seam between the network and the local event system
-// for gameplay event notifications (Spare Parts-specific, SDL-free and socket-free, so it is
-// unit tested without a Game or a real PeerClient). Neither side knows about the other:
-// Engine::EventManager is not network-aware and PeerClient has no EventManager. This class,
-// owned by Game and used only on the main thread, is the only place they meet.
+// The explicit seam between the network and the local game for discrete gameplay notifications
+// (Spare Parts-specific, SDL-free and socket-free, so it is unit tested without a Game or a real
+// PeerClient). Neither side knows about the other: Engine::EventManager is not network-aware and
+// PeerClient has no EventManager. This class, owned by Game and used only on the main thread, is
+// the only place they meet. Three notifications cross it: Death, Spawn and Shoot.
 //
-// LOCAL -> NETWORK. When a Death event for the LOCAL player is dispatched (the same event
-// ShipController turns into a scheduled respawn), this bridge also hands a Death notification
-// to `sendToPeers` (Game wires it to PeerClient::PublishEvent). A Death event about any
-// other object is never re-broadcast, so a received notification can never echo back out.
+// AUTHORITY MODEL. Every client is authoritative for its OWN ship only: its movement, whether a
+// bullet hit it, its Death and its Spawn. Nobody ever declares ANOTHER player dead. A shooter
+// announces that it fired; each other client rebuilds that bullet and, if the bullet reaches ITS
+// own ship, that client raises its own Collision -> Death (see ShipController) and announces it.
 //
-// NETWORK -> LOCAL. HandleNetworkEvent() takes a decoded notification, resolves its
-// network PlayerId to THIS client's own GameObject for that remote player, and raises an
-// ordinary Engine Death event about that object's local ObjectId. The EventManager stamps
-// it with the RECEIVER's logical time — the sender's clock is never transmitted or used.
-// A PlayerId with no matching remote object (unknown, or already disconnected) is ignored.
+// LOCAL -> NETWORK.
+//  - A Death or Spawn event whose subject is the LOCAL ship is announced to `sendToPeers` (Game
+//    wires it to PeerClient::PublishEvent). An event about any other object is never re-announced,
+//    so a received notification can never echo back out.
+//  - AnnounceShot() (Game wires ShipController's shot listener to it) announces a bullet the
+//    local ship really fired, with its origin and heading.
+//  SetAnnounceEnabled(false) silences all three at once (for replay playback, so a replayed
+//  death, spawn or shot is never broadcast as a new one).
 //
-// WHY A REMOTE DEATH CAN NEVER RESPAWN THE LOCAL PLAYER. The raised event is the same
-// EventType::Death, but its Subject is the remote player's object, and ShipController
-// handles a Death only when the Subject is the local ship (it returns immediately
-// otherwise). Local and remote deaths are therefore separated by WHO the event is about —
-// no new engine event type, no flag — and each is handled by its own subscriber: the
-// controller for the local ship, this bridge for remote players.
+// NETWORK -> LOCAL. HandleNetworkEvent() takes a decoded notification:
+//  - Shoot: rebuilds the bullet in the receiver's BulletField from the received origin and
+//    heading and the SHARED speed/lifetime constants. Nothing else: it does not decide who gets
+//    hit. Accepted even if that player's state has not arrived yet (the bullet is real).
+//  - Death / Spawn: resolves the sender's PlayerId to THIS client's own object for that remote
+//    player and raises an ordinary Engine Death / Spawn event about THAT object. (A Death or
+//    Spawn event about a remote object can never touch the local ship: ShipController handles
+//    only events whose subject is the local ship.) An unknown or disconnected player is ignored.
+//  - Anything claiming to come from the local player's own id is ignored (a loop-back).
+//  The EventManager stamps events with the RECEIVER's logical time — the sender's clock is never
+//  transmitted or used.
 //
-// REMOTE REACTION. This bridge's Death handler, for a remote subject, marks that player
-// "recently died" for MarkDuration of logical time, measured from the event's own
-// (receiver-local) timestamp. Game renders a marked remote player in an alternate color.
-// Time comes from the same Timeline-backed source as the EventManager, so pausing or
-// scaling the Timeline affects the marker exactly as it affects everything else.
-//
-// Delivery is not guaranteed (see PeerClient.h): a lost notification just means no marker.
+// REMOTE LIFE STATE, kept by PlayerId. A remote player is ALIVE until its Death arrives, and
+// stays DEAD until its Spawn arrives — never because a timer ran out. (Newly discovered players
+// have no entry, so they are alive.) A visible death marker shows for MarkDuration after the
+// death, measured from the event's own receiver-local timestamp; after that the ship is simply
+// hidden. Delivery is not guaranteed (see PeerClient.h): a lost Spawn leaves that player hidden
+// until its next Death or Spawn arrives — an accepted limit of the peer-authoritative slice.
 class PeerEventBridge
 {
 public:
-	/// How long, in logical seconds, a remote player stays marked after a Death event.
+	/// How long, in logical seconds, a remote player's death marker shows after its Death.
 	static constexpr double MarkDuration = 1.0;
 
-	/// `events` and `objects` must outlive the bridge. `localPlayerObjectId` is the local
-	/// player's object, whose network id (set once connected) is what gets announced.
-	/// `sendToPeers` is called, synchronously inside Death dispatch, once per local death.
-	/// `timeSource` must be the same logical clock the EventManager uses.
-	PeerEventBridge(Engine::EventManager& events, Engine::GameObjectRegistry& objects,
-	                Engine::ObjectId localPlayerObjectId, std::function<double()> timeSource,
-	                std::function<void(Engine::NetworkEventKind)> sendToPeers);
+	using NetworkSink = std::function<void(const Engine::NetworkEvent&)>;
 
-	// The Death subscription captures `this`; never copy or move.
+	/// `events`, `objects` and `bullets` must outlive the bridge. `localShipObjectId` is the local
+	/// ship's object, whose network id (set once connected) identifies it on the wire.
+	/// `sendToPeers` is called synchronously, once per announcement; the frame's source id is
+	/// re-stamped by the transport. `timeSource` must be the same logical clock the EventManager uses.
+	PeerEventBridge(Engine::EventManager& events, Engine::GameObjectRegistry& objects, BulletField& bullets,
+	                Engine::ObjectId localShipObjectId, std::function<double()> timeSource, NetworkSink sendToPeers);
+
+	// The subscriptions capture `this`; never copy or move.
 	PeerEventBridge(const PeerEventBridge&) = delete;
 	PeerEventBridge& operator=(const PeerEventBridge&) = delete;
 
-	/// Raises the local Death event for a received notification (see class comment).
-	/// Returns false, raising nothing, if no remote object has that network PlayerId.
+	/// Applies one received notification (see the class comment). Returns false, doing
+	/// nothing, if it was ignored (loop-back, or Death/Spawn for an unknown player).
 	bool HandleNetworkEvent(const Engine::NetworkEvent& networkEvent);
 
-	/// While disabled, a local Death is NOT announced to peers. For replay playback (not
-	/// wired in Game at present), so a replayed death is never broadcast as a new one. Remote
-	/// notifications and markers are unaffected (peers are live during a local replay).
+	/// Announces a bullet the local ship just fired, at `origin` (its centre) along the heading.
+	void AnnounceShot(Engine::Vector2 origin, float headingRadians);
+
+	/// While disabled, nothing local is announced to peers (Death, Spawn or Shoot). Received
+	/// notifications and remote life state are unaffected (peers stay live during a local replay).
 	void SetAnnounceEnabled(bool enabled);
 
-	/// True while the remote object is within its marked-dead window.
-	bool IsMarkedDead(Engine::ObjectId remoteObjectId) const;
+	/// False from a remote player's Death until its Spawn; true for everyone else.
+	bool IsRemoteAlive(Engine::ObjectId remoteObjectId) const;
 
-	/// Drops expired markers and markers for objects that no longer exist (a remote player
-	/// that disconnected). Call once per frame; IsMarkedDead() is correct without it.
-	void PruneMarkers();
+	/// True while the remote player's death marker should be drawn (dead, within MarkDuration).
+	bool IsDeathMarkerActive(Engine::ObjectId remoteObjectId) const;
+
+	/// Forgets life state of players whose object no longer exists (disconnected). Call once per
+	/// frame; the queries above are correct without it.
+	void PruneRemoved();
 
 private:
 	void OnDeath(const Engine::Event& event);
+	void OnSpawn(const Engine::Event& event);
+
+	void Announce(const Engine::NetworkEvent& event);
+	Engine::PlayerId LocalNetworkId() const;
+	// The network id of a remote object, or 0 if it has none (not a networked player).
+	Engine::PlayerId NetworkIdOf(Engine::ObjectId objectId) const;
 
 	Engine::EventManager& m_Events;
 	Engine::GameObjectRegistry& m_Objects;
-	Engine::ObjectId m_LocalPlayerObjectId;
+	BulletField& m_Bullets;
+	Engine::ObjectId m_LocalShipObjectId;
 	std::function<double()> m_TimeSource;
-	std::function<void(Engine::NetworkEventKind)> m_SendToPeers;
+	NetworkSink m_SendToPeers;
 
-	// Remote object -> logical time its marker expires.
-	std::unordered_map<Engine::ObjectId, double> m_MarkerExpiry;
+	// PlayerId -> logical time of its (latest) Death. Present means dead.
+	std::unordered_map<Engine::PlayerId, double> m_DeadSince;
 
 	bool m_AnnounceEnabled = true;
 
 	// Declared last: destroyed first, unsubscribing while m_Events is still alive.
 	Engine::ScopedSubscription m_DeathSubscription;
+	Engine::ScopedSubscription m_SpawnSubscription;
 };

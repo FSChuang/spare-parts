@@ -75,6 +75,9 @@ constexpr Engine::EventPriority SpawnEventPriority = Engine::EventPriority::Crit
 class ShipController
 {
 public:
+	/// Told about every bullet this ship actually fires: its starting centre and heading.
+	using ShotListener = std::function<void(Engine::Vector2 origin, float headingRadians)>;
+
 	/// `events`, `objects` and `bullets` must outlive this controller (Game declares them
 	/// first). `selectSpawnCentre` is asked for the ship's spawn point each time it dies.
 	/// `timeSource` is the logical clock. Subscribes the handlers; removed on destruction.
@@ -107,6 +110,11 @@ public:
 	/// currently overlapping it. Does nothing while dead. Changes no state itself.
 	void DetectBulletHits();
 
+	/// Registers the one listener told of each bullet this ship successfully fires (Game wires
+	/// it to the network announcement). It is NOT called for a shot that is blocked by the
+	/// cooldown or by the ship being dead — only when a bullet really came into existence.
+	void SetShotListener(ShotListener listener);
+
 	/// Raises a Spawn event placing the ship's centre at `centre` (the initial spawn).
 	void RequestSpawn(Engine::Vector2 centre);
 
@@ -132,6 +140,7 @@ private:
 	ShipConfig m_Config;
 	std::function<Engine::Vector2()> m_SelectSpawnCentre;
 	std::function<double()> m_TimeSource;
+	ShotListener m_ShotListener;
 
 	// What the keys looked like at the last RaiseInputEvents() call (observation), kept
 	// separate from the intent the Input handler maintains (state).

@@ -24,9 +24,11 @@ namespace
 
 	constexpr Engine::Color LocalShipColor{ 0, 170, 255, 255 };
 	constexpr Engine::Color RemoteShipColor{ 255, 150, 40, 255 };
-	// A remote ship is drawn in this color while its "recently died" marker is active
-	// (Milestone 4 networked Death event) — purely presentational, never networked.
-	constexpr Engine::Color RemoteShipDeadColor{ 255, 255, 255, 255 };
+	// A remote ship that has died shows this marker (a white square, a bit larger than the
+	// ship) for PeerEventBridge::MarkDuration, then nothing until its Spawn arrives. Purely
+	// presentational, never networked.
+	constexpr Engine::Color RemoteDeathMarkerColor{ 255, 255, 255, 255 };
+	constexpr float RemoteDeathMarkerSize = 3.0f * Astro::ShipRadius;
 	constexpr Engine::Color NoseColor{ 255, 255, 255, 255 };
 
 	// The nose marker: a small square centred on the ship's rim, so rotation is obvious.
@@ -41,8 +43,6 @@ namespace
 
 	// Keys. Rotation and fire map onto the Engine's game-neutral input actions.
 	constexpr SDL_Scancode FireKey = SDL_SCANCODE_SPACE;
-	// Temporary dev aid until remote players can shoot: drops a bullet nobody owns on the ship.
-	constexpr SDL_Scancode DebugHitKey = SDL_SCANCODE_K;
 
 	// Local-player sentinel network id before NetworkClient's handshake has assigned a
 	// real one (Protocol.h: PlayerId 0 is reserved "unassigned"). The local ship always has a
@@ -81,18 +81,21 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 	// handled in the first Update()'s input phase, is what formally brings the ship to life.
 	m_Ship->RequestSpawn(SelectSpawnCentre());
 
-	// The local ship's own Death events are announced to peers through m_PeerClient, which
-	// only exists once the server handshake has completed — before that there is nobody to
+	// The local ship's own Death, Spawn and Shoot are announced to peers through m_PeerClient,
+	// which only exists once the server handshake has completed — before that there is nobody to
 	// tell. (PublishEvent just queues; the PeerClient worker does the sending.)
 	m_PeerEvents = std::make_unique<PeerEventBridge>(
-	    m_Events, m_Objects, m_LocalShipObjectId, m_TimeSource,
-	    [this](Engine::NetworkEventKind kind)
+	    m_Events, m_Objects, m_Bullets, m_LocalShipObjectId, m_TimeSource,
+	    [this](const Engine::NetworkEvent& event)
 	    {
 		    if (m_PeerClient)
 		    {
-			    m_PeerClient->PublishEvent(kind);
+			    m_PeerClient->PublishEvent(event);
 		    }
 	    });
+
+	// Every bullet the local ship really fires is announced to peers (never a blocked shot).
+	m_Ship->SetShotListener([this](Engine::Vector2 origin, float heading) { m_PeerEvents->AnnounceShot(origin, heading); });
 }
 
 Engine::Vector2 Game::SelectSpawnCentre() const
@@ -164,9 +167,23 @@ void Game::Render(Engine::Renderer& renderer)
 		}
 		else if (object.HasNetworkId())
 		{
+			if (!m_PeerEvents->IsRemoteAlive(id))
+			{
+				// Dead until its Spawn arrives: a short marker, then nothing.
+				if (m_PeerEvents->IsDeathMarkerActive(id))
+				{
+					Engine::GameObject marker(0, Engine::ObjectType::Generic, { 0.0f, 0.0f },
+					                          { RemoteDeathMarkerSize, RemoteDeathMarkerSize });
+					SetCenter(marker, CenterOf(object));
+					marker.SetRender(RemoteDeathMarkerColor);
+					renderer.DrawObject(marker);
+				}
+				continue;
+			}
+
 			auto heading = m_RemoteHeadings.find(id);
-			Engine::Color color = m_PeerEvents->IsMarkedDead(id) ? RemoteShipDeadColor : RemoteShipColor;
-			DrawShip(renderer, CenterOf(object), heading != m_RemoteHeadings.end() ? heading->second : 0.0f, color);
+			DrawShip(renderer, CenterOf(object), heading != m_RemoteHeadings.end() ? heading->second : 0.0f,
+			         RemoteShipColor);
 		}
 		else
 		{
@@ -203,11 +220,6 @@ void Game::PollInputEvents(Engine::InputManager& input)
 	bool firePressed = input.IsKeyJustPressed(FireKey);
 
 	m_Ship->RaiseInputEvents(rotatingLeft, rotatingRight, firePressed);
-
-	if (input.IsKeyJustPressed(DebugHitKey))
-	{
-		m_Bullets.Fire(CenterOf(*m_Objects.Find(m_LocalShipObjectId)), 0.0f, Engine::NoObjectId);
-	}
 }
 
 void Game::UpdateNetworking(float deltaTime)
@@ -237,11 +249,12 @@ void Game::UpdateNetworking(float deltaTime)
 		}
 	}
 
-	// Milestone 4 Checkpoint 3: received peer event notifications. Drained here on the main
-	// thread (PeerClient's worker only queues them) and raised into m_Events, which stamps
-	// them with THIS client's logical time; they are dispatched at the start of the next
-	// Update(). Remote objects used to resolve them are the ones applied by earlier frames
-	// below, so a notification that beats its sender's first state is simply ignored.
+	// Received peer event notifications, drained here on the main thread (PeerClient's worker only
+	// queues them, in arrival order). A Shoot becomes a bullet in m_Bullets right away; a Death or
+	// Spawn is raised into m_Events, which stamps it with THIS client's logical time, and is
+	// dispatched at the start of the next Update(). Remote objects used to resolve a Death/Spawn
+	// are the ones applied by earlier frames below, so one that beats its sender's first state is
+	// simply ignored.
 	if (m_PeerClient)
 	{
 		for (const Engine::NetworkEvent& networkEvent : m_PeerClient->PollEvents())
@@ -249,7 +262,7 @@ void Game::UpdateNetworking(float deltaTime)
 			m_PeerEvents->HandleNetworkEvent(networkEvent);
 		}
 	}
-	m_PeerEvents->PruneMarkers();
+	m_PeerEvents->PruneRemoved();
 
 	// The local player's network-relevant state, extracted from its GameObject through
 	// the explicit Milestone 3 boundary (see NetworkState.h) rather than built from a

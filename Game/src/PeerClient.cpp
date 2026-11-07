@@ -73,11 +73,11 @@ void PeerClient::UpdatePeers(const std::vector<Engine::PeerInfo>& peers)
 	m_WorkerWakeCondition.notify_one();
 }
 
-void PeerClient::PublishEvent(Engine::NetworkEventKind kind)
+void PeerClient::PublishEvent(const Engine::NetworkEvent& event)
 {
 	{
 		std::lock_guard<std::mutex> lock(m_OutgoingMutex);
-		m_PendingOutgoingEvents.push_back(kind);
+		m_PendingOutgoingEvents.push_back(event);
 	}
 	m_WorkerWakeCondition.notify_one();
 }
@@ -128,7 +128,7 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 	{
 		std::optional<Engine::PlayerState> stateToSend;
 		std::optional<std::vector<Engine::PeerInfo>> desiredPeers;
-		std::deque<Engine::NetworkEventKind> eventsToSend;
+		std::deque<Engine::NetworkEvent> eventsToSend;
 		{
 			std::unique_lock<std::mutex> lock(m_OutgoingMutex);
 			// Bounded wait, never a blocking Receive(): wakes immediately on a new
@@ -222,9 +222,10 @@ void PeerClient::WorkerMain(Engine::PlayerId localPlayerId, std::uint16_t localP
 		// Event notifications go out in the order they were raised, after this tick's state
 		// (the two are independent streams on the one PUB socket). The source id is stamped
 		// here, on the worker, from the id this client was constructed with.
-		for (Engine::NetworkEventKind kind : eventsToSend)
+		for (Engine::NetworkEvent event : eventsToSend)
 		{
-			pub.Send(ToFrame(Engine::EncodeNetworkEvent(Engine::NetworkEvent{ kind, localPlayerId })));
+			event.SourcePlayerId = localPlayerId;
+			pub.Send(ToFrame(Engine::EncodeNetworkEvent(event)));
 		}
 
 		// Drain every currently-available peer message — TryReceive() never blocks, so

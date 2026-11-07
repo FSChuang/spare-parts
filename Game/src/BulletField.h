@@ -17,9 +17,17 @@
 // Update(), so pausing or slowing the Timeline pauses or slows a bullet's life exactly as it
 // slows its flight, and a zero-length frame changes nothing.
 //
-// The OWNER is the ObjectId of the firing ship, never a network id: a network id changes once
-// the server assigns one, which would make a bullet fired just before that moment suddenly
-// "belong to someone else". NoObjectId means "nobody's" (a bullet that can hit any ship).
+// OWNERSHIP (decided in the networked-combat checkpoint). A bullet's owner is the ObjectId of the
+// ship object that fired it IN THIS CLIENT's registry, not a PlayerId:
+//  - A client only ever asks one question: "is this bullet MINE?" (never hit my own ship), and
+//    every client's own ship object id is fixed for the whole run. A PlayerId is not: the local
+//    one is 0 until the server assigns it, so a bullet fired just before that would change
+//    from "mine" to "somebody else's" and could shoot its own ship. An ObjectId cannot change.
+//  - A bullet rebuilt from a peer's Shoot is owned by that peer's ship object here, or by
+//    NoObjectId if the peer's state has not arrived yet. Either way it is not the local ship's,
+//    so it can hit the local ship — which is the point.
+//  - The PlayerId lives only at the wire boundary (the Shoot announcement and its receipt).
+// NoObjectId means "nobody's" (a bullet that can hit any ship).
 
 struct BulletConfig
 {

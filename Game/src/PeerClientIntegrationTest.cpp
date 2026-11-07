@@ -16,7 +16,10 @@
 // file (a real multi-second/timing scenario, not a pure deterministic unit).
 
 #include "PeerClient.h"
+#include "ArenaRules.h"
+#include "BulletField.h"
 #include "PeerEventBridge.h"
+#include "ShipController.h"
 
 #include "Engine/Event/EventManager.h"
 #include "Engine/GameObject/GameObjectRegistry.h"
@@ -25,6 +28,7 @@
 #include "Engine/Network/Socket.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -354,7 +358,7 @@ int main()
 		b.UpdatePeers({ MakePeer(1, 6201) });
 		Check(WarmUp(a, 1, b), "Event_Setup_SubscriptionEstablished");
 
-		a.PublishEvent(Engine::NetworkEventKind::Death);
+		a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
 		std::vector<Engine::NetworkEvent> received = CollectEvents(b, 1, PollTimeoutMs);
 		Check(received.size() == 1 && received[0].Kind == Engine::NetworkEventKind::Death &&
 		          received[0].SourcePlayerId == 1,
@@ -374,7 +378,7 @@ int main()
 		const std::size_t eventCount = 25;
 		for (std::size_t i = 0; i < eventCount; ++i)
 		{
-			a.PublishEvent(Engine::NetworkEventKind::Death); // back to back: a slot would keep only the last
+			a.PublishEvent({ Engine::NetworkEventKind::Death, 0 }); // back to back: a slot would keep only the last
 		}
 		std::vector<Engine::NetworkEvent> received = CollectEvents(b, eventCount, PollTimeoutMs);
 		Check(received.size() == eventCount, "Event_BurstOfEvents_NoneOverwrittenOrCoalesced");
@@ -395,7 +399,7 @@ int main()
 		{
 			last = Engine::PlayerState{ 1, 100.0f + static_cast<float>(i), 50.0f, 3.0f, 4.0f };
 			a.PublishState(last);
-			a.PublishEvent(Engine::NetworkEventKind::Death);
+			a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
 			std::this_thread::sleep_for(std::chrono::milliseconds(15));
 		}
 		std::vector<Engine::NetworkEvent> received = CollectEvents(b, eventCount, PollTimeoutMs);
@@ -463,7 +467,7 @@ int main()
 			                                        ++handled;
 		                                        });
 
-		a.PublishEvent(Engine::NetworkEventKind::Death);
+		a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
 		for (const Engine::NetworkEvent& event : CollectEvents(b, 1, PollTimeoutMs))
 		{
 			manager.Raise(Engine::DeathEventData{ event.SourcePlayerId, Engine::NoObjectId });
@@ -483,47 +487,176 @@ int main()
 		b.UpdatePeers({ MakePeer(1, 6251) });
 		WarmUp(a, 1, b);
 
-		a.PublishEvent(Engine::NetworkEventKind::Death);
+		a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
 		b.UpdatePeers({}); // b drops a right as the event is in flight
 		std::this_thread::sleep_for(std::chrono::milliseconds(150));
 		b.PollEvents(); // whatever beat the removal is fine; nothing may crash
 		for (int i = 0; i < 3; ++i)
 		{
-			a.PublishEvent(Engine::NetworkEventKind::Death);
+			a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
 		}
 		Check(DrainFor(b, 300).empty(), "PeerRefresh_RemovedPeersEventsAreNoLongerDelivered");
 
 		b.UpdatePeers({ MakePeer(1, 6251) }); // and a rejoining peer works again
 		WarmUp(a, 1, b);
-		a.PublishEvent(Engine::NetworkEventKind::Death);
+		a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
 		Check(CollectEvents(b, 1, PollTimeoutMs).size() >= 1, "PeerRefresh_ReaddedPeerDeliversEventsAgain");
 	}
 
 
+	// ===== Networked arena combat: Shoot and Spawn over the same channel =====
+
+	// --- Test 11: Shoot carries its payload exactly, and Shoot / Death / Spawn stay in order
+	// with state frames interleaved between them ---
+	{
+		PeerClient a(1, 6271);
+		PeerClient b(2, 6272);
+		a.UpdatePeers({ MakePeer(2, 6272) });
+		b.UpdatePeers({ MakePeer(1, 6271) });
+		Check(WarmUp(a, 1, b), "Combat_Setup_SubscriptionEstablished");
+		Check(WarmUp(b, 2, a), "Combat_Setup_ReverseSubscriptionEstablished");
+
+		Engine::NetworkEvent firstShot{ Engine::NetworkEventKind::Shoot, 0 };
+		firstShot.OriginX = 516.5f;
+		firstShot.OriginY = -12.25f;
+		firstShot.HeadingRadians = 1.5f;
+		Engine::NetworkEvent secondShot{ Engine::NetworkEventKind::Shoot, 0 };
+		secondShot.OriginX = 1943.0f;
+		secondShot.OriginY = 540.0f;
+		secondShot.HeadingRadians = -2.3561945f;
+
+		Engine::PlayerState last{};
+		a.PublishState(Engine::PlayerState{ 1, 10.0f, 20.0f, 3.0f, 4.0f });
+		a.PublishEvent(firstShot);
+		a.PublishState(Engine::PlayerState{ 1, 11.0f, 21.0f, 3.0f, 4.0f });
+		a.PublishEvent(secondShot);
+		a.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
+		last = Engine::PlayerState{ 1, 12.0f, 22.0f, 3.0f, 4.0f };
+		a.PublishState(last);
+		a.PublishEvent({ Engine::NetworkEventKind::Spawn, 0 });
+
+		std::vector<Engine::NetworkEvent> received = CollectEvents(b, 4, PollTimeoutMs);
+		Check(received.size() == 4, "Combat_FourEventsDelivered_NoneLostToStateFrames");
+		bool orderAndKinds = received.size() == 4 && received[0].Kind == Engine::NetworkEventKind::Shoot &&
+		                     received[1].Kind == Engine::NetworkEventKind::Shoot && received[2].Kind == Engine::NetworkEventKind::Death &&
+		                     received[3].Kind == Engine::NetworkEventKind::Spawn;
+		Check(orderAndKinds, "Combat_ShootShootDeathSpawn_ArriveInTheOrderTheyWereRaised");
+		bool sourceIds = received.size() == 4;
+		for (const Engine::NetworkEvent& event : received)
+		{
+			sourceIds = sourceIds && event.SourcePlayerId == 1;
+		}
+		Check(sourceIds, "Combat_EveryEventCarriesTheSendersPlayerId");
+		Check(received.size() >= 2 && received[0].OriginX == 516.5f && received[0].OriginY == -12.25f &&
+		          received[0].HeadingRadians == 1.5f,
+		      "Combat_FirstShoot_PayloadExact");
+		Check(received.size() >= 2 && received[1].OriginX == 1943.0f && received[1].OriginY == 540.0f &&
+		          received[1].HeadingRadians == -2.3561945f,
+		      "Combat_SecondShoot_PayloadExact_NotOverwrittenByTheFirst");
+		Check(DrainFor(b, 250).empty(), "Combat_EventsDeliveredExactlyOnce");
+		bool stateIntact = WaitUntil([&]() { return StateMatches(b.GetLatestPeerStates(), 1, last); }, PollTimeoutMs,
+		                              PollIntervalMs);
+		Check(stateIntact, "Combat_LatestStateStillExactAmongTheEvents");
+		Check(a.PollEvents().empty(), "Combat_SenderNeverReceivesItsOwnEvents");
+
+		// And the other direction: B's Death, then B's Spawn, reach A.
+		b.PublishState(Engine::PlayerState{ 2, 5.0f, 6.0f, 0.0f, 0.0f });
+		b.PublishEvent({ Engine::NetworkEventKind::Death, 0 });
+		b.PublishState(Engine::PlayerState{ 2, 5.0f, 6.0f, 0.0f, 0.0f });
+		b.PublishEvent({ Engine::NetworkEventKind::Spawn, 0 });
+		std::vector<Engine::NetworkEvent> backwards = CollectEvents(a, 2, PollTimeoutMs);
+		Check(backwards.size() == 2 && backwards[0].Kind == Engine::NetworkEventKind::Death &&
+		          backwards[1].Kind == Engine::NetworkEventKind::Spawn && backwards[0].SourcePlayerId == 2 &&
+		          backwards[1].SourcePlayerId == 2,
+		      "Combat_BsDeathThenSpawn_ReachA_InOrder");
+		Check(DrainFor(a, 200).empty(), "Combat_BsEvents_ReceivedExactlyOnce");
+	}
+
+	// --- Test 12: a burst of Shoots is a queue, not a latest-wins slot ---
+	{
+		PeerClient a(1, 6281);
+		PeerClient b(2, 6282);
+		a.UpdatePeers({ MakePeer(2, 6282) });
+		b.UpdatePeers({ MakePeer(1, 6281) });
+		WarmUp(a, 1, b);
+
+		const std::size_t shotCount = 30;
+		for (std::size_t i = 0; i < shotCount; ++i)
+		{
+			Engine::NetworkEvent shot{ Engine::NetworkEventKind::Shoot, 0 };
+			shot.OriginX = static_cast<float>(i);
+			shot.OriginY = 2.0f * static_cast<float>(i);
+			shot.HeadingRadians = 0.01f * static_cast<float>(i);
+			a.PublishEvent(shot);
+		}
+		std::vector<Engine::NetworkEvent> received = CollectEvents(b, shotCount, PollTimeoutMs);
+		bool fifo = received.size() == shotCount;
+		for (std::size_t i = 0; fifo && i < shotCount; ++i)
+		{
+			fifo = received[i].Kind == Engine::NetworkEventKind::Shoot && received[i].OriginX == static_cast<float>(i) &&
+			       received[i].OriginY == 2.0f * static_cast<float>(i) &&
+			       received[i].HeadingRadians == 0.01f * static_cast<float>(i);
+		}
+		Check(fifo, "Burst_ThirtyShoots_AllArrive_InOrder_PayloadsIntact");
+		Check(DrainFor(b, 200).empty(), "Burst_NoShootDuplicated");
+	}
+
 	// --- Test 13: the whole path, two miniature "games", real PeerClient hop in the middle ---
-	// A's local Death event -> A's bridge -> PeerClient PUB -> B's PeerClient SUB -> B polls ->
-	// B's bridge -> B's own EventManager (on a DIFFERENT logical clock) -> visible marker on B.
+	// A fires; B (a different logical clock) rebuilds the bullet; the bullet reaches B's own ship;
+	// B alone decides it died and announces it; A shows B dead until B announces its Spawn.
 	{
 		struct World
 		{
-			World(Engine::PlayerId localId, Engine::PlayerId remoteId, double startTime, PeerClient& peer)
-				: Now(startTime), Events([this]() { return Now; })
+			World(Engine::PlayerId localId, Engine::PlayerId remoteId, double startTime, PeerClient& peer,
+			      Engine::Vector2 shipCentre, Engine::Vector2 remoteCentre)
+				: Now(startTime),
+				  Events([this]() { return Now; }),
+				  Physics(0.0f),
+				  Bullets(Objects, Physics, BulletConfig{ 200.0f, 1.4f, 5.0f }),
+				  Peer(peer)
 			{
-				Engine::GameObject& local = Objects.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, { 50.0f, 50.0f });
+				Engine::GameObject& local = Objects.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, { 48.0f, 48.0f });
+				SetCenter(local, shipCentre);
+				local.SetVelocity({ 0.0f, 0.0f });
 				local.SetNetworkId(localId);
 				LocalObjectId = local.GetId();
-				Engine::GameObject& remote = Objects.Create(Engine::ObjectType::Player, { 300.0f, 0.0f }, { 50.0f, 50.0f });
+				Engine::GameObject& remote = Objects.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, { 48.0f, 48.0f });
+				SetCenter(remote, remoteCentre);
 				remote.SetNetworkId(remoteId);
 				RemoteObjectId = remote.GetId();
-				Bridge = std::make_unique<PeerEventBridge>(Events, Objects, LocalObjectId, [this]() { return Now; },
-				                                          [&peer](Engine::NetworkEventKind kind) { peer.PublishEvent(kind); });
+
+				Controller = std::make_unique<ShipController>(
+				    Events, Objects, Bullets, LocalObjectId, ShipConfig{ 100.0f, 2.0f, 24.0f, 36.0f, 0.5, 2.0, 1.0 },
+				    [shipCentre] { return shipCentre; }, [this]() { return Now; });
+				Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, LocalObjectId, [this]() { return Now; },
+				                                          [&peer](const Engine::NetworkEvent& event) { peer.PublishEvent(event); });
+				Controller->SetShotListener([this](Engine::Vector2 origin, float heading) { Bridge->AnnounceShot(origin, heading); });
+			}
+
+			// One game frame, in the order Game::Update runs it, then the network poll.
+			void Step(float dt)
+			{
+				Now += dt;
+				Controller->BeginFrame();
+				Events.DispatchDue();
+				Bullets.Update(dt);
+				Controller->DetectBulletHits();
+				Events.DispatchDue();
+				for (const Engine::NetworkEvent& event : Peer.PollEvents())
+				{
+					Bridge->HandleNetworkEvent(event);
+				}
 			}
 
 			double Now;
 			Engine::EventManager Events;
 			Engine::GameObjectRegistry Objects;
+			Engine::PhysicsSystem Physics;
+			BulletField Bullets;
+			PeerClient& Peer;
 			Engine::ObjectId LocalObjectId = 0;
 			Engine::ObjectId RemoteObjectId = 0;
+			std::unique_ptr<ShipController> Controller;
 			std::unique_ptr<PeerEventBridge> Bridge;
 		};
 
@@ -532,25 +665,87 @@ int main()
 		peerA.UpdatePeers({ MakePeer(2, 6262) });
 		peerB.UpdatePeers({ MakePeer(1, 6261) });
 		WarmUp(peerA, 1, peerB);
+		WarmUp(peerB, 2, peerA);
 
-		World worldA(1, 2, 1000.0, peerA); // very different logical clocks: nothing may depend on them matching
-		World worldB(2, 1, 5.0, peerB);
+		// A at x=480 facing right; B's ship sits 220 px ahead of it. Very different logical clocks.
+		World worldA(1, 2, 1000.0, peerA, { 480.0f, 540.0f }, { 700.0f, 540.0f });
+		World worldB(2, 1, 5.0, peerB, { 700.0f, 540.0f }, { 480.0f, 540.0f });
 
-		worldA.Events.Raise(Engine::DeathEventData{ worldA.LocalObjectId, Engine::NoObjectId });
-		worldA.Events.DispatchDue(); // A handles its own death; its bridge announces it
+		// Both ships spawn; each spawn is announced and the invulnerability window passes.
+		worldA.Controller->RequestSpawn({ 480.0f, 540.0f });
+		worldB.Controller->RequestSpawn({ 700.0f, 540.0f });
+		worldA.Step(0.0f);
+		worldB.Step(0.0f);
+		worldA.Now += 1.0;
+		worldB.Now += 1.0;
+		DrainFor(peerA, 150); // (the Spawn announcements are consumed below by the steps)
+		worldA.Step(0.0f);
+		worldB.Step(0.0f);
+		Check(worldA.Controller->IsAlive() && worldB.Controller->IsAlive() && !worldA.Controller->IsInvulnerable(),
+		      "EndToEnd_Setup_BothShipsAliveAndVulnerable");
 
-		std::vector<Engine::NetworkEvent> received = CollectEvents(peerB, 1, PollTimeoutMs);
-		bool bridged = received.size() == 1 && worldB.Bridge->HandleNetworkEvent(received[0]);
-		Check(bridged, "EndToEnd_PeerBReceivesAndBridgesAsDeathOfItsRemoteObjectForA");
-		Check(!worldB.Bridge->IsMarkedDead(worldB.RemoteObjectId), "EndToEnd_NoReactionUntilBsEventManagerDispatches");
-		worldB.Events.DispatchDue();
-		Check(worldB.Bridge->IsMarkedDead(worldB.RemoteObjectId), "EndToEnd_BsRemotePlayerAIsVisiblyMarkedDead");
-		Check(!worldB.Bridge->IsMarkedDead(worldB.LocalObjectId), "EndToEnd_BsOwnPlayerIsNotMarked");
-		Check(!worldA.Bridge->IsMarkedDead(worldA.RemoteObjectId), "EndToEnd_AsView_OfB_IsUnaffected");
+		// A fires.
+		worldA.Controller->RaiseInputEvents(false, false, true);
+		worldA.Step(0.0f);
+		Check(worldA.Bullets.All().size() == 1, "EndToEnd_AFiredOneBullet");
 
-		worldB.Now = 5.0 + PeerEventBridge::MarkDuration + 0.1; // B's own clock decides expiry
-		Check(!worldB.Bridge->IsMarkedDead(worldB.RemoteObjectId), "EndToEnd_MarkerExpiresOnBsLogicalClock");
-		Check(DrainFor(peerA, 200).empty(), "EndToEnd_AReceivesNoEchoOfItsOwnDeath");
+		// B receives exactly one Shoot and rebuilds one bullet.
+		bool rebuilt = WaitUntil(
+		    [&]()
+		    {
+			    worldB.Step(0.0f);
+			    return worldB.Bullets.All().size() >= 1;
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+		Check(rebuilt && worldB.Bullets.All().size() == 1, "EndToEnd_BRebuiltExactlyOneBullet");
+		const Engine::GameObject* rebuiltBullet = worldB.Objects.Find(worldB.Bullets.All()[0].Id);
+		Check(rebuiltBullet != nullptr && std::fabs(CenterOf(*rebuiltBullet).X - 516.0f) < 0.01f &&
+		          std::fabs(CenterOf(*rebuiltBullet).Y - 540.0f) < 0.01f && rebuiltBullet->GetVelocity().X == 200.0f,
+		      "EndToEnd_BsBulletMatchesAsOriginAndHeading");
+		Check(worldB.Controller->IsAlive() && worldB.Bridge->IsRemoteAlive(worldB.RemoteObjectId),
+		      "EndToEnd_NobodyIsDeadJustBecauseASoftShotWasReceived");
+
+		// Both clients advance in step; B alone detects the hit on its own ship.
+		for (int i = 0; i < 20 && worldB.Controller->IsAlive(); ++i)
+		{
+			worldA.Step(0.05f);
+			worldB.Step(0.05f);
+		}
+		Check(!worldB.Controller->IsAlive(), "EndToEnd_BsOwnShipDiedWhenTheReconstructedBulletReachedIt");
+		Check(worldA.Controller->IsAlive() && worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId),
+		      "EndToEnd_AHasNotDeclaredBDeadItselfNorHasAnythingReachedItYet");
+
+		// B announced its Death; A learns it and shows B dead (and persistently so).
+		bool aSawDeath = WaitUntil(
+		    [&]()
+		    {
+			    worldA.Step(0.0f);
+			    return !worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId);
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+		Check(aSawDeath, "EndToEnd_AShowsBDeadAfterBsOwnDeathAnnouncement");
+		worldA.Now += 50.0;
+		worldA.Step(0.0f);
+		Check(!worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId) && !worldA.Bridge->IsDeathMarkerActive(worldA.RemoteObjectId),
+		      "EndToEnd_BStaysDeadForAAfterTheMarkerExpired");
+		Check(worldA.Controller->IsAlive(), "EndToEnd_BsDeathNeverKilledA");
+
+		// B's respawn delay elapses; its Spawn is announced and A shows it alive again.
+		worldB.Now += 2.0;
+		worldB.Step(0.0f);
+		Check(worldB.Controller->IsAlive(), "EndToEnd_BRespawnedAfterTheDelay");
+		bool aSawSpawn = WaitUntil(
+		    [&]()
+		    {
+			    worldA.Step(0.0f);
+			    return worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId);
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+		Check(aSawSpawn, "EndToEnd_AShowsBAliveAgainOnlyAfterBsSpawnAnnouncement");
+
+		// Nothing echoed: each side received only what the other announced.
+		Check(worldB.Controller->IsAlive() && worldA.Controller->IsAlive() && worldA.Bullets.All().size() <= 1,
+		      "EndToEnd_NoEchoOrFeedbackLoop");
 	}
 
 	std::printf("\n%s\n", g_Failures == 0 ? "All tests passed." : "Some tests FAILED.");

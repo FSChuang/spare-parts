@@ -81,8 +81,10 @@ public:
 
 	// Queues a gameplay event notification about THIS client's player for every peer
 	// (FIFO; nothing is overwritten or coalesced) and wakes the worker. The wire frame's
-	// source id is always this client's own PlayerId — a caller cannot name another player.
-	void PublishEvent(Engine::NetworkEventKind kind);
+	// source id is always this client's own PlayerId: whatever `event.SourcePlayerId` holds is
+	// replaced, so a caller cannot name another player. Kinds that carry a payload (Shoot's
+	// origin and heading) are sent with it as given.
+	void PublishEvent(const Engine::NetworkEvent& event);
 
 	// Returns, in arrival order, every event notification received since the last call, and
 	// clears them. Only notifications from currently-desired peers are kept (never our own,
@@ -116,7 +118,7 @@ private:
 	std::condition_variable m_WorkerWakeCondition;
 	std::optional<Engine::PlayerState> m_PendingOutgoingState;
 	std::optional<std::vector<Engine::PeerInfo>> m_PendingPeers;
-	std::deque<Engine::NetworkEventKind> m_PendingOutgoingEvents;
+	std::deque<Engine::NetworkEvent> m_PendingOutgoingEvents;
 	bool m_StopRequested = false;
 
 	// --- incoming: written by the worker thread, read by the main thread ---

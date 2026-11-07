@@ -137,8 +137,11 @@ target_link_libraries(NetworkRateAndPlatformTest PRIVATE Engine EngineNetwork Th
 # Game/src/*IntegrationTest.cpp files. PeerClient is NOT yet linked into `main` —
 # this checkpoint proves it independently, before any Game integration.
 add_executable(PeerClientIntegrationTest
+    src/ArenaRules.cpp
+    src/BulletField.cpp
     src/PeerClient.cpp
     src/PeerEventBridge.cpp
+    src/ShipController.cpp
     src/PeerClientIntegrationTest.cpp
 )
 target_link_libraries(PeerClientIntegrationTest PRIVATE EngineNetwork EngineCore Threads::Threads)
