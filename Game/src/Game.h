@@ -10,6 +10,7 @@
 #include "NetworkClient.h"
 #include "PeerClient.h"
 #include "PeerEventBridge.h"
+#include "ReplayController.h"
 #include "ShipController.h"
 
 #include <chrono>
@@ -50,9 +51,10 @@ namespace Engine
 // ship is shown alive until its Death arrives and hidden (after a brief marker) until its Spawn.
 // See PeerEventBridge.h.
 //
-// REPLAY (F5/F6/F7) is switched off in this checkpoint: the old replay samples described a
-// platformer (camera, platforms, enemy). The Engine's ReplayRecorder and the replay control
-// events remain; the Astro replay controller returns in a later checkpoint.
+// REPLAY: F5 starts recording, F6 stops, F7 plays it back (each raises a replay control event; on
+// a Mac laptop hold fn). A local, in-memory review of the local ship and its bullets — see
+// ReplayController.h. While it plays the live ship and live bullets are frozen out of the
+// simulation and peers keep seeing the ship where it stood.
 class Game
 {
 public:
@@ -122,4 +124,8 @@ private:
 	// Gameplay event notifications between peers (death announce + remote death marker).
 	// Declared last for the same reason as m_Ship.
 	std::unique_ptr<PeerEventBridge> m_PeerEvents;
+
+	// Record / play back the local ship's gameplay. Declared last: it references m_Ship and
+	// m_PeerEvents and must release its subscriptions before them and before m_Events.
+	std::unique_ptr<ReplayController> m_Replay;
 };

@@ -43,6 +43,11 @@ bool PeerEventBridge::HandleNetworkEvent(const Engine::NetworkEvent& networkEven
 
 	if (networkEvent.Kind == Engine::NetworkEventKind::Shoot)
 	{
+		if (m_DiscardRemoteShoots)
+		{
+			return false; // drained by the caller, never rebuilt, never kept for later
+		}
+
 		// Rebuild the bullet; whom it hits is decided later, by the victim's own ship. Its owner
 		// is that peer's ship object here when we know it, else nobody's — never the local ship.
 		const Engine::GameObject* shooter = m_Objects.FindByNetworkId(networkEvent.SourcePlayerId);
@@ -131,6 +136,11 @@ void PeerEventBridge::OnSpawn(const Engine::Event& event)
 void PeerEventBridge::SetAnnounceEnabled(bool enabled)
 {
 	m_AnnounceEnabled = enabled;
+}
+
+void PeerEventBridge::SetRemoteShootsDiscarded(bool discarded)
+{
+	m_DiscardRemoteShoots = discarded;
 }
 
 bool PeerEventBridge::IsRemoteAlive(Engine::ObjectId remoteObjectId) const

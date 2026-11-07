@@ -1,5 +1,7 @@
 #include "ShipController.h"
 
+#include <algorithm>
+#include <limits>
 #include <utility>
 
 ShipController::ShipController(Engine::EventManager& events, Engine::GameObjectRegistry& objects,
@@ -40,6 +42,11 @@ void ShipController::BeginFrame()
 
 void ShipController::RaiseInputEvents(bool leftHeld, bool rightHeld, bool firePressed)
 {
+	if (m_PlaybackMode)
+	{
+		return; // live input must not reach a replayed ship (and the held-key memory stays put)
+	}
+
 	if (leftHeld != m_LeftHeldLastFrame)
 	{
 		m_LeftHeldLastFrame = leftHeld;
@@ -60,6 +67,11 @@ void ShipController::RaiseInputEvents(bool leftHeld, bool rightHeld, bool firePr
 
 void ShipController::ApplySteering(float deltaTime)
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	Engine::GameObject& ship = Ship();
 
 	if (!m_State.Alive)
@@ -79,7 +91,7 @@ void ShipController::ApplySteering(float deltaTime)
 
 void ShipController::WrapAroundArena()
 {
-	if (!m_State.Alive)
+	if (m_PlaybackMode || !m_State.Alive)
 	{
 		return;
 	}
@@ -90,7 +102,7 @@ void ShipController::WrapAroundArena()
 
 void ShipController::DetectBulletHits()
 {
-	if (!m_State.Alive)
+	if (m_PlaybackMode || !m_State.Alive)
 	{
 		return;
 	}
@@ -110,6 +122,53 @@ void ShipController::SetShotListener(ShotListener listener)
 void ShipController::RequestSpawn(Engine::Vector2 centre)
 {
 	m_Events.Raise(Engine::SpawnEventData{ m_ShipId, centre }, SpawnEventPriority);
+}
+
+void ShipController::SetPlaybackMode(bool playback)
+{
+	m_PlaybackMode = playback;
+}
+
+bool ShipController::IsPlaybackMode() const
+{
+	return m_PlaybackMode;
+}
+
+ShipSnapshot ShipController::Capture() const
+{
+	const Engine::GameObject& ship = *m_Objects.Find(m_ShipId);
+	const double now = m_TimeSource();
+
+	// Remaining time, clamped at 0: a timer that already ran out is "complete", not negative.
+	double cooldownRemaining = std::max(0.0, m_State.LastFireTime + m_Config.FireCooldown - now);
+	double invulnerabilityRemaining = std::max(0.0, m_State.InvulnerableUntil - now);
+	return ShipSnapshot{ ship.GetPosition(), ship.GetVelocity(), m_State.HeadingRadians, m_State.Alive,
+		                 cooldownRemaining, invulnerabilityRemaining };
+}
+
+void ShipController::Restore(const ShipSnapshot& snapshot)
+{
+	Engine::GameObject& ship = Ship();
+	ship.SetPosition(snapshot.Position);
+	ship.SetVelocity(snapshot.Velocity);
+	m_State.HeadingRadians = snapshot.HeadingRadians;
+	m_State.Alive = snapshot.Alive;
+
+	// Rebase the timers onto now. Zero remaining means "already complete" and is restored as
+	// complete (-infinity), exactly like a ship that has never fired or never been protected.
+	const double now = m_TimeSource();
+	constexpr double Never = -std::numeric_limits<double>::infinity();
+	m_State.LastFireTime = snapshot.CooldownRemaining > 0.0 ? now + snapshot.CooldownRemaining - m_Config.FireCooldown : Never;
+	m_State.InvulnerableUntil = snapshot.InvulnerabilityRemaining > 0.0 ? now + snapshot.InvulnerabilityRemaining : Never;
+}
+
+void ShipController::ApplyReplayPose(Engine::Vector2 centre, Engine::Vector2 velocity, float headingRadians, bool alive)
+{
+	Engine::GameObject& ship = Ship();
+	SetCenter(ship, centre);
+	ship.SetVelocity(velocity);
+	m_State.HeadingRadians = headingRadians;
+	m_State.Alive = alive;
 }
 
 const ShipState& ShipController::State() const
@@ -134,6 +193,11 @@ float ShipController::Heading() const
 
 void ShipController::OnInput(const Engine::InputEventData& input)
 {
+	if (m_PlaybackMode)
+	{
+		return; // replayed events are observed, never acted on live
+	}
+
 	switch (input.Action)
 	{
 	case Engine::InputAction::MoveLeft:
@@ -181,6 +245,11 @@ void ShipController::TryFire()
 
 void ShipController::OnCollision(const Engine::CollisionEventData& collision)
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	if (collision.A != m_ShipId && collision.B != m_ShipId)
 	{
 		return; // not about this ship
@@ -218,6 +287,11 @@ void ShipController::RaiseDeath(Engine::ObjectId cause)
 
 void ShipController::OnDeath(const Engine::DeathEventData& death)
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	if (death.Subject != m_ShipId || !m_State.Alive)
 	{
 		return; // someone else's death, or this ship is already dead (never schedule two Spawns)
@@ -233,6 +307,11 @@ void ShipController::OnDeath(const Engine::DeathEventData& death)
 
 void ShipController::OnSpawn(const Engine::SpawnEventData& spawn)
 {
+	if (m_PlaybackMode)
+	{
+		return;
+	}
+
 	if (spawn.Subject != m_ShipId)
 	{
 		return;

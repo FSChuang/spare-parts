@@ -53,6 +53,19 @@ struct ShipState
 	double InvulnerableUntil = -std::numeric_limits<double>::infinity();
 };
 
+/// Everything about the live ship that replay playback overwrites, captured so it can be put back.
+/// The two timers are stored as REMAINING durations, not absolute times: playback consumes logical
+/// time, so absolute timestamps would have expired by the time it ends.
+struct ShipSnapshot
+{
+	Engine::Vector2 Position;      // the ship object's position (top-left, like every GameObject)
+	Engine::Vector2 Velocity;
+	float HeadingRadians;
+	bool Alive;
+	double CooldownRemaining;      // seconds until the next shot is allowed; 0 = ready
+	double InvulnerabilityRemaining; // seconds of protection left; 0 = none
+};
+
 struct ShipConfig
 {
 	float Speed;               // px/s, forward
@@ -118,6 +131,22 @@ public:
 	/// Raises a Spawn event placing the ship's centre at `centre` (the initial spawn).
 	void RequestSpawn(Engine::Vector2 centre);
 
+	/// Replay playback gate. While on, this controller does not drive the live ship: Input,
+	/// Collision, Death and Spawn events are ignored (a replayed event is OBSERVED, the recorded
+	/// sample owns what is shown — in particular a replayed Death schedules no real Spawn and a
+	/// replayed ActionPrimary fires nothing), and RaiseInputEvents, ApplySteering,
+	/// WrapAroundArena and DetectBulletHits do nothing. Turning it off resumes normal gameplay.
+	void SetPlaybackMode(bool playback);
+	bool IsPlaybackMode() const;
+
+	/// Reads the state playback will overwrite (see ShipSnapshot).
+	ShipSnapshot Capture() const;
+	/// Puts a captured snapshot back. The timers are rebased onto the CURRENT logical time: a
+	/// cooldown with 0.2 s left has 0.2 s left again from now; a finished one stays finished.
+	void Restore(const ShipSnapshot& snapshot);
+	/// Replay only: shows the recorded ship (centre, velocity, heading, alive flag).
+	void ApplyReplayPose(Engine::Vector2 centre, Engine::Vector2 velocity, float headingRadians, bool alive);
+
 	const ShipState& State() const;
 	bool IsAlive() const;
 	bool IsInvulnerable() const;
@@ -150,6 +179,7 @@ private:
 	bool m_RotateLeft = false;
 	bool m_RotateRight = false;
 	bool m_DeathRaisedThisFrame = false;
+	bool m_PlaybackMode = false;
 	ShipState m_State;
 
 	// Declared last: destroyed first, unsubscribing while the EventManager is still alive.

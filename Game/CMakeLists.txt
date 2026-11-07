@@ -16,6 +16,7 @@ add_executable(main
     src/NetworkState.cpp
     src/PeerClient.cpp
     src/PeerEventBridge.cpp
+    src/ReplayController.cpp
     src/ShipController.cpp
     src/main.cpp
 )
@@ -88,6 +89,20 @@ add_executable(PeerEventBridgeTest
     src/PeerEventBridgeTest.cpp
 )
 target_link_libraries(PeerEventBridgeTest PRIVATE EngineCore EngineNetworkCore)
+
+# Astro rebuild Checkpoint D: replay (control events, state samples, playback, live-state
+# restore, suppression of live input / bullets / network announcements during playback). Real
+# EventManager/ReplayRecorder/ShipController/BulletField/PeerEventBridge/GameObjects on a fake
+# clock; no SDL, no sockets.
+add_executable(ReplayControllerTest
+    src/ArenaRules.cpp
+    src/BulletField.cpp
+    src/PeerEventBridge.cpp
+    src/ReplayController.cpp
+    src/ShipController.cpp
+    src/ReplayControllerTest.cpp
+)
+target_link_libraries(ReplayControllerTest PRIVATE EngineCore EngineNetworkCore)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't

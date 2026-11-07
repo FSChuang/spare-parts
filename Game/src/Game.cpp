@@ -44,6 +44,17 @@ namespace
 	// Keys. Rotation and fire map onto the Engine's game-neutral input actions.
 	constexpr SDL_Scancode FireKey = SDL_SCANCODE_SPACE;
 
+	// Replay controls. F-keys, so they never clash with rotate/fire or the engine's own Tab / P /
+	// 1-2-3 debug keys. (On a Mac laptop hold fn if the OS claims them.)
+	constexpr SDL_Scancode ReplayStartKey = SDL_SCANCODE_F5;
+	constexpr SDL_Scancode ReplayStopKey = SDL_SCANCODE_F6;
+	constexpr SDL_Scancode ReplayPlayKey = SDL_SCANCODE_F7;
+
+	// While a replay plays, the local ship and the replayed bullets are drawn in these colors, so
+	// it is obvious that what is on screen is the recording and not live play.
+	constexpr Engine::Color ReplayShipColor{ 0, 220, 120, 255 };
+	constexpr Engine::Color ReplayBulletColor{ 150, 255, 200, 255 };
+
 	// Local-player sentinel network id before NetworkClient's handshake has assigned a
 	// real one (Protocol.h: PlayerId 0 is reserved "unassigned"). The local ship always has a
 	// network-id property, so ToPlayerState() never needs a special case for "not connected yet".
@@ -96,6 +107,9 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 
 	// Every bullet the local ship really fires is announced to peers (never a blocked shot).
 	m_Ship->SetShotListener([this](Engine::Vector2 origin, float heading) { m_PeerEvents->AnnounceShot(origin, heading); });
+
+	m_Replay = std::make_unique<ReplayController>(m_Events, m_Objects, m_Bullets, *m_Ship, *m_PeerEvents,
+	                                              m_LocalShipObjectId, m_TimeSource);
 }
 
 Engine::Vector2 Game::SelectSpawnCentre() const
@@ -111,10 +125,14 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	// Frame order, with two deliberate event-dispatch phases:
 	//
 	//  1. BeginFrame        allow a new death this frame
-	//  2. PollInputEvents   held rotate-key CHANGES and fresh fire presses become Input events
-	//  3. DispatchDue #1    input takes effect BEFORE movement (rotation intent, a shot is
-	//                       fired); the initial Spawn, and a respawn whose delay has elapsed,
-	//                       are delivered here too — so a ship that just came back moves this frame
+	//  2. PollInputEvents   held rotate-key CHANGES and fresh fire presses become Input events;
+	//                       F5/F6/F7 raise the replay control events
+	//  3. DispatchDue #1    replay control takes effect; input takes effect BEFORE movement
+	//                       (rotation intent, a shot is fired); the initial Spawn, and a respawn
+	//                       whose delay has elapsed, are delivered here too; while a replay plays,
+	//                       its re-scheduled events are delivered here (observed only)
+	//
+	//  LIVE (not replaying):
 	//  4. ApplySteering     rotate by the intent, set the forward velocity (zero if dead)
 	//  5. physics           integrate the ship's velocity (zero gravity)
 	//  6. wrap              a ship that fully left the arena reappears on the opposite side
@@ -123,7 +141,14 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	//  9. DispatchDue #2    the whole chain runs now, in one call: Collision -> Death. The Spawn it
 	//                       schedules is `RespawnDelay` in the future, so it is NOT due here. A death
 	//                       never waits for the next frame, and networking reads the final state
-	// 10. networking        publishes this frame's final ship state
+	//  (While a replay PLAYS, 4-9 are skipped: the recorded frames own the ship and its bullets,
+	//   and the live BulletField is not touched at all — it is frozen exactly as it was.)
+	//
+	// 10. networking        publishes this frame's final ship state (the saved live state, not the
+	//                       replay, while one plays); remote players stay live
+	// 11. UpdatePlayback    shows the recorded frame for the elapsed playback time, and ends
+	//                       playback (restoring the live ship) when the span is over
+	// 12. CaptureFrame      while recording, stores this frame's final state
 	//
 	// A frame with deltaTime == 0 (the Timeline reads whole milliseconds) changes no heading and
 	// moves nothing, but still delivers any due events.
@@ -132,22 +157,29 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	PollInputEvents(input);
 	m_Events.DispatchDue();
 
-	m_Ship->ApplySteering(deltaTime);
-	m_Physics.Update(*m_Objects.Find(m_LocalShipObjectId), deltaTime);
-	m_Ship->WrapAroundArena();
+	if (!m_Replay->IsPlaying())
+	{
+		m_Ship->ApplySteering(deltaTime);
+		m_Physics.Update(*m_Objects.Find(m_LocalShipObjectId), deltaTime);
+		m_Ship->WrapAroundArena();
 
-	m_Bullets.Update(deltaTime);
-	m_Ship->DetectBulletHits();
-	m_Events.DispatchDue();
+		m_Bullets.Update(deltaTime);
+		m_Ship->DetectBulletHits();
+		m_Events.DispatchDue();
+	}
 
 	// Networking runs after the local simulation so it always publishes this frame's final
 	// state — never a stale pre-respawn position.
 	UpdateNetworking(deltaTime);
+
+	m_Replay->UpdatePlayback();
+	m_Replay->CaptureFrame();
 }
 
 void Game::Render(Engine::Renderer& renderer)
 {
 	const double now = m_TimeSource();
+	const bool replaying = m_Replay->IsPlaying();
 
 	for (auto& [id, object] : m_Objects)
 	{
@@ -155,11 +187,14 @@ void Game::Render(Engine::Renderer& renderer)
 		{
 			if (!m_Ship->IsAlive())
 			{
-				continue; // a dead ship is not drawn
+				continue; // a dead ship is not drawn (while replaying: the recorded ship is dead)
 			}
 
-			Engine::Color color = LocalShipColor;
-			if (m_Ship->IsInvulnerable() && std::fmod(now, BlinkPeriodSeconds) < BlinkPeriodSeconds / 2.0)
+			// The ship object holds the recorded pose while a replay plays, so it is drawn the same
+			// way; only its color and where the "invulnerable" flag comes from differ.
+			Engine::Color color = replaying ? ReplayShipColor : LocalShipColor;
+			bool invulnerable = replaying ? m_Replay->CurrentSample().Invulnerable : m_Ship->IsInvulnerable();
+			if (invulnerable && std::fmod(now, BlinkPeriodSeconds) < BlinkPeriodSeconds / 2.0)
 			{
 				color.A = BlinkDimAlpha;
 			}
@@ -185,9 +220,22 @@ void Game::Render(Engine::Renderer& renderer)
 			DrawShip(renderer, CenterOf(object), heading != m_RemoteHeadings.end() ? heading->second : 0.0f,
 			         RemoteShipColor);
 		}
-		else
+		else if (!replaying)
 		{
-			renderer.DrawObject(object); // a bullet
+			renderer.DrawObject(object); // a live bullet (hidden while a replay plays)
+		}
+	}
+
+	if (replaying)
+	{
+		// The recorded bullets: bare positions from the sample, never live objects.
+		const float size = 2.0f * Astro::BulletRadius;
+		for (const ReplayBullet& bullet : m_Replay->CurrentSample().Bullets)
+		{
+			Engine::GameObject shot(0, Engine::ObjectType::Generic, { 0.0f, 0.0f }, { size, size });
+			SetCenter(shot, bullet.Centre);
+			shot.SetRender(ReplayBulletColor);
+			renderer.DrawObject(shot);
 		}
 	}
 }
@@ -220,6 +268,21 @@ void Game::PollInputEvents(Engine::InputManager& input)
 	bool firePressed = input.IsKeyJustPressed(FireKey);
 
 	m_Ship->RaiseInputEvents(rotatingLeft, rotatingRight, firePressed);
+
+	// Replay controls are raised as EVENTS (never calling the recorder directly); the
+	// ReplayController / ReplayRecorder react when they are dispatched.
+	if (input.IsKeyJustPressed(ReplayStartKey))
+	{
+		m_Replay->RequestStartRecording();
+	}
+	if (input.IsKeyJustPressed(ReplayStopKey))
+	{
+		m_Replay->RequestStopRecording();
+	}
+	if (input.IsKeyJustPressed(ReplayPlayKey))
+	{
+		m_Replay->RequestPlayback();
+	}
 }
 
 void Game::UpdateNetworking(float deltaTime)
@@ -268,6 +331,16 @@ void Game::UpdateNetworking(float deltaTime)
 	// the explicit Milestone 3 boundary (see NetworkState.h) rather than built from a
 	// second, independent player-state representation.
 	Engine::PlayerState localState = ToPlayerState(player);
+	if (m_Replay->IsPlaying())
+	{
+		// The ship object currently shows the recording. Peers must never see that as movement,
+		// so keep publishing where the real ship stood when playback began.
+		const ShipSnapshot& live = m_Replay->SavedLiveShip();
+		localState.PositionX = live.Position.X;
+		localState.PositionY = live.Position.Y;
+		localState.VelocityX = live.Velocity.X;
+		localState.VelocityY = live.Velocity.Y;
+	}
 
 	// P2P gameplay publish: Timeline-scaled, exactly as Section 4 established
 	// (0.5x/1x/2x -> ~15/30/60 Hz), now redirected to PeerClient instead of the server.
@@ -407,9 +480,10 @@ void Game::SubscribeEventLogging()
 	// One concise line per event, so a manual run can show all four required event types
 	// firing. Input and Collision are transition-only (not per-frame), and Death/Spawn are
 	// rare, so this never floods the console. Gameplay does not depend on any of it.
-	auto logEvent = [](const Engine::Event& event)
+	auto logEvent = [this](const Engine::Event& event)
 	{
-		std::printf("[Event t=%.2f] ", event.Timestamp);
+		// Events dispatched while a replay plays are the recording being re-run.
+		std::printf("[Event t=%.2f%s] ", event.Timestamp, (m_Replay && m_Replay->IsPlaying()) ? " replay" : "");
 		switch (event.Type)
 		{
 		case Engine::EventType::Input:
@@ -439,14 +513,23 @@ void Game::SubscribeEventLogging()
 			std::printf("Spawn object %u at (%.0f, %.0f)\n", spawn.Subject, spawn.Position.X, spawn.Position.Y);
 			break;
 		}
-		default:
-			break; // replay control events are not subscribed to here
+		case Engine::EventType::ReplayStart:
+			std::printf("ReplayStart\n");
+			break;
+		case Engine::EventType::ReplayStop:
+			std::printf("ReplayStop\n");
+			break;
+		case Engine::EventType::ReplayPlay:
+			std::printf("ReplayPlay\n");
+			break;
 		}
 		std::fflush(stdout);
 	};
 
 	for (Engine::EventType type : { Engine::EventType::Input, Engine::EventType::Collision,
-	                                 Engine::EventType::Death, Engine::EventType::Spawn })
+	                                 Engine::EventType::Death, Engine::EventType::Spawn,
+	                                 Engine::EventType::ReplayStart, Engine::EventType::ReplayStop,
+	                                 Engine::EventType::ReplayPlay })
 	{
 		m_EventLogSubscriptions.emplace_back(m_Events, type, logEvent);
 	}

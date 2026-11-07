@@ -27,7 +27,8 @@
 //  - AnnounceShot() (Game wires ShipController's shot listener to it) announces a bullet the
 //    local ship really fired, with its origin and heading.
 //  SetAnnounceEnabled(false) silences all three at once (for replay playback, so a replayed
-//  death, spawn or shot is never broadcast as a new one).
+//  death, spawn or shot is never broadcast as a new one). SetRemoteShootsDiscarded(true) is its
+//  receiving-side twin: during playback a remote Shoot is dropped, not rebuilt or queued.
 //
 // NETWORK -> LOCAL. HandleNetworkEvent() takes a decoded notification:
 //  - Shoot: rebuilds the bullet in the receiver's BulletField from the received origin and
@@ -77,6 +78,12 @@ public:
 	/// notifications and remote life state are unaffected (peers stay live during a local replay).
 	void SetAnnounceEnabled(bool enabled);
 
+	/// While on, a received Shoot is drained and DISCARDED: no bullet is built and it is not kept
+	/// for later. A remote shot belongs to the live timeline and must not interact with a
+	/// replayed ship (nor surface, stale, once playback ends). Death, Spawn and remote state
+	/// still apply normally. Game turns this on for the length of a replay playback.
+	void SetRemoteShootsDiscarded(bool discarded);
+
 	/// False from a remote player's Death until its Spawn; true for everyone else.
 	bool IsRemoteAlive(Engine::ObjectId remoteObjectId) const;
 
@@ -107,6 +114,7 @@ private:
 	std::unordered_map<Engine::PlayerId, double> m_DeadSince;
 
 	bool m_AnnounceEnabled = true;
+	bool m_DiscardRemoteShoots = false;
 
 	// Declared last: destroyed first, unsubscribing while m_Events is still alive.
 	Engine::ScopedSubscription m_DeathSubscription;
