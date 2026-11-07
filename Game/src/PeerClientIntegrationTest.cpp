@@ -628,7 +628,7 @@ int main()
 				Controller = std::make_unique<ShipController>(
 				    Events, Objects, Bullets, LocalObjectId, ShipConfig{ 100.0f, 2.0f, 24.0f, 36.0f, 0.5, 2.0, 1.0 },
 				    [shipCentre] { return shipCentre; }, [this]() { return Now; });
-				Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, LocalObjectId, [this]() { return Now; },
+				Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, LocalObjectId,
 				                                          [&peer](const Engine::NetworkEvent& event) { peer.PublishEvent(event); });
 				Controller->SetShotListener([this](Engine::Vector2 origin, float heading) { Bridge->AnnounceShot(origin, heading); });
 			}
@@ -640,6 +640,7 @@ int main()
 				Controller->BeginFrame();
 				Events.DispatchDue();
 				Bullets.Update(dt);
+				Controller->DetectSolidHits();
 				Controller->DetectBulletHits();
 				Events.DispatchDue();
 				for (const Engine::NetworkEvent& event : Peer.PollEvents())
@@ -726,8 +727,7 @@ int main()
 		Check(aSawDeath, "EndToEnd_AShowsBDeadAfterBsOwnDeathAnnouncement");
 		worldA.Now += 50.0;
 		worldA.Step(0.0f);
-		Check(!worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId) && !worldA.Bridge->IsDeathMarkerActive(worldA.RemoteObjectId),
-		      "EndToEnd_BStaysDeadForAAfterTheMarkerExpired");
+		Check(!worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId), "EndToEnd_BStaysDeadForALongAfterTheExplosion");
 		Check(worldA.Controller->IsAlive(), "EndToEnd_BsDeathNeverKilledA");
 
 		// B's respawn delay elapses; its Spawn is announced and A shows it alive again.
@@ -742,6 +742,37 @@ int main()
 		    },
 		    PollTimeoutMs, PollIntervalMs);
 		Check(aSawSpawn, "EndToEnd_AShowsBAliveAgainOnlyAfterBsSpawnAnnouncement");
+
+		// The same chain, but the killer is a WALL (map geometry, no Shoot involved): B flies into one.
+		worldB.Now += 1.0; // B's spawn protection runs out
+		worldB.Step(0.0f);
+		Check(worldB.Controller->IsAlive() && !worldB.Controller->IsInvulnerable(), "EndToEnd_Wall_BIsAliveAndVulnerableAgain");
+		worldB.Objects.Create(Engine::ObjectType::Boundary, { 690.0f, 500.0f }, { 40.0f, 80.0f }); // right on B's ship
+		worldB.Step(0.0f);
+		Check(!worldB.Controller->IsAlive(), "EndToEnd_Wall_BDiedOnTheWall");
+		bool aSawWallDeath = WaitUntil(
+		    [&]()
+		    {
+			    worldA.Step(0.0f);
+			    return !worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId);
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+		Check(aSawWallDeath, "EndToEnd_Wall_AShowsBDeadAfterAWallDeath");
+		Check(worldA.Controller->IsAlive(), "EndToEnd_Wall_ANeverDiedFromBsWallDeath");
+		// B's scheduled respawn comes due: the Spawn handler revives it (this miniature world's spawn
+		// point is where the wall now stands, which is harmless: a fresh spawn is protected) and
+		// announces the Spawn, so A shows it alive again.
+		worldB.Now += 2.0;
+		worldB.Step(0.0f);
+		Check(worldB.Controller->IsAlive(), "EndToEnd_Wall_BRespawned");
+		bool aSawWallSpawn = WaitUntil(
+		    [&]()
+		    {
+			    worldA.Step(0.0f);
+			    return worldA.Bridge->IsRemoteAlive(worldA.RemoteObjectId);
+		    },
+		    PollTimeoutMs, PollIntervalMs);
+		Check(aSawWallSpawn, "EndToEnd_Wall_AShowsBAliveAgainAfterItsSpawn");
 
 		// Nothing echoed: each side received only what the other announced.
 		Check(worldB.Controller->IsAlive() && worldA.Controller->IsAlive() && worldA.Bullets.All().size() <= 1,

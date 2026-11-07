@@ -89,15 +89,24 @@ void ShipController::ApplySteering(float deltaTime)
 	ship.SetVelocity({ forward.X * m_Config.Speed, forward.Y * m_Config.Speed });
 }
 
-void ShipController::WrapAroundArena()
+void ShipController::DetectSolidHits()
 {
-	if (m_PlaybackMode || !m_State.Alive)
+	// Nothing to do while dead, in playback, or protected: a wall is not consumed by touching it, so
+	// an invulnerable ship simply passes through (spawn points are clear of every solid anyway).
+	if (m_PlaybackMode || !m_State.Alive || IsInvulnerable())
 	{
 		return;
 	}
 
-	Engine::GameObject& ship = Ship();
-	SetCenter(ship, WrapShipCentre(CenterOf(ship), m_Config.Radius));
+	const Engine::Vector2 centre = CenterOf(Ship());
+	for (const auto& [id, object] : m_Objects)
+	{
+		if (object.GetType() == Engine::ObjectType::Boundary &&
+		    CircleVsRect(centre, m_Config.Radius, object.GetPosition(), object.GetSize()))
+		{
+			m_Events.Raise(Engine::CollisionEventData{ m_ShipId, id }, CollisionEventPriority);
+		}
+	}
 }
 
 void ShipController::DetectBulletHits()
@@ -256,9 +265,25 @@ void ShipController::OnCollision(const Engine::CollisionEventData& collision)
 	}
 
 	Engine::ObjectId otherId = collision.A == m_ShipId ? collision.B : collision.A;
-	if (!m_State.Alive || !m_Bullets.Contains(otherId))
+	if (!m_State.Alive)
 	{
-		return; // a dead ship cannot be hit, and the bullet may already be gone
+		return; // a dead ship cannot be hit
+	}
+
+	// A wall or obstacle is lethal on contact — unless the ship is protected.
+	const Engine::GameObject* other = m_Objects.Find(otherId);
+	if (other != nullptr && other->GetType() == Engine::ObjectType::Boundary)
+	{
+		if (!IsInvulnerable())
+		{
+			RaiseDeath(otherId);
+		}
+		return;
+	}
+
+	if (!m_Bullets.Contains(otherId))
+	{
+		return; // not a bullet, or it is already gone
 	}
 
 	// The bullet is spent on contact, whether or not it hurts.
@@ -320,7 +345,7 @@ void ShipController::OnSpawn(const Engine::SpawnEventData& spawn)
 	Engine::GameObject& ship = Ship();
 	SetCenter(ship, spawn.Position);
 
-	m_State.HeadingRadians = NormalizeHeading(HeadingTowardArenaCentre(spawn.Position));
+	m_State.HeadingRadians = NormalizeHeading(SpawnHeadingFor(spawn.Position));
 	Engine::Vector2 forward = ForwardOf(m_State.HeadingRadians);
 	ship.SetVelocity({ forward.X * m_Config.Speed, forward.Y * m_Config.Speed });
 

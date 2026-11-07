@@ -11,10 +11,9 @@
 #include <functional>
 #include <limits>
 
-// Astro rebuild Checkpoint B: the LOCAL ship's gameplay, driven by the Engine event system.
+// The LOCAL ship's gameplay, driven by the Engine event system.
 // Spare Parts-specific and deliberately SDL-free and network-free, so the whole event flow is
-// unit tested without a Game. It replaces the platformer's LocalPlayerController and keeps
-// that class's useful structure: ScopedSubscriptions, a per-frame death guard, and a real
+// unit tested without a Game. It is built around ScopedSubscriptions, a per-frame death guard and a real
 // Input -> Collision -> Death -> Spawn chain.
 //
 // The ship's generic physical state (position, size, velocity, network id, colour) lives in an
@@ -27,9 +26,11 @@
 //
 // THE EVENT CHAIN
 //   Input       MoveLeft / MoveRight (held) set the rotation intent; ActionPrimary fires.
-//   Collision   Raised by DetectBulletHits() when a bullet overlaps the ship. Detection never
-//               kills anything. The handler consumes the bullet and, unless the ship is
-//               invulnerable, raises Death.
+//   Collision   Raised by DetectBulletHits() when a bullet overlaps the ship, and by
+//               DetectSolidHits() when the ship touches a wall or obstacle. Detection never kills
+//               anything. The handler is what makes either lethal: a bullet is consumed, and unless
+//               the ship is invulnerable it raises Death. (There is no wrap-around: the walls are
+//               solid and deadly.)
 //   Death       The handler marks the ship dead, stops it, and SCHEDULES a Spawn
 //               `RespawnDelay` later. It does not revive anything.
 //   Spawn       The ONE place a ship becomes alive: position, heading (toward the arena
@@ -116,8 +117,10 @@ public:
 	/// unchanged. The caller integrates the velocity with the physics system afterwards.
 	void ApplySteering(float deltaTime);
 
-	/// Wraps a ship that has fully left the arena to the opposite side (WrapShipCentre).
-	void WrapAroundArena();
+	/// Raises a Collision{ship, solid} event for every wall or obstacle (registry object of type
+	/// Boundary) the ship's circle currently overlaps. Does nothing while dead or invulnerable
+	/// (a solid is not consumed, so there is nothing to observe), and changes no state itself.
+	void DetectSolidHits();
 
 	/// Raises a Collision{ship, bullet} event for every bullet, not fired by this ship,
 	/// currently overlapping it. Does nothing while dead. Changes no state itself.
@@ -135,7 +138,7 @@ public:
 	/// Collision, Death and Spawn events are ignored (a replayed event is OBSERVED, the recorded
 	/// sample owns what is shown — in particular a replayed Death schedules no real Spawn and a
 	/// replayed ActionPrimary fires nothing), and RaiseInputEvents, ApplySteering,
-	/// WrapAroundArena and DetectBulletHits do nothing. Turning it off resumes normal gameplay.
+	/// DetectSolidHits and DetectBulletHits do nothing. Turning it off resumes normal gameplay.
 	void SetPlaybackMode(bool playback);
 	bool IsPlaybackMode() const;
 

@@ -3,10 +3,13 @@
 #include "ArenaRules.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace
 {
-	constexpr Engine::Color BulletColor{ 255, 240, 120, 255 };
+	// A bullet never moves further than this between two wall checks, so a slow frame cannot carry
+	// it through a wall (the thinnest solid is 32 px; a 0.1 s frame at 720 px/s is 72 px).
+	constexpr float MaxStepDistance = 16.0f;
 }
 
 BulletField::BulletField(Engine::GameObjectRegistry& objects, const Engine::PhysicsSystem& physics,
@@ -25,28 +28,55 @@ Engine::ObjectId BulletField::Fire(Engine::Vector2 muzzleCentre, float headingRa
 
 	Engine::Vector2 forward = ForwardOf(headingRadians);
 	object.SetVelocity({ forward.X * m_Config.Speed, forward.Y * m_Config.Speed });
-	object.SetRender(BulletColor);
 
 	m_Bullets.push_back({ object.GetId(), owner, 0.0f });
 	return object.GetId();
 }
 
+bool BulletField::TouchesSolid(const Engine::GameObject& bullet) const
+{
+	const Engine::Vector2 centre = CenterOf(bullet);
+	for (const auto& [id, other] : m_Objects)
+	{
+		if (other.GetType() == Engine::ObjectType::Boundary &&
+		    CircleVsRect(centre, m_Config.Radius, other.GetPosition(), other.GetSize()))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 void BulletField::Update(float deltaTime)
 {
-	for (Bullet& bullet : m_Bullets)
+	std::vector<bool> hitSolid(m_Bullets.size(), false);
+
+	for (std::size_t i = 0; i < m_Bullets.size(); ++i)
 	{
+		Bullet& bullet = m_Bullets[i];
 		Engine::GameObject* object = m_Objects.Find(bullet.Id);
 		if (object != nullptr)
 		{
-			m_Physics.Update(*object, deltaTime);
+			// Move in short steps, checking for a wall after each; a bullet that touches one is
+			// spent right there.
+			Engine::Vector2 velocity = object->GetVelocity();
+			float distance = std::sqrt(velocity.X * velocity.X + velocity.Y * velocity.Y) * deltaTime;
+			int steps = std::max(1, static_cast<int>(std::ceil(distance / MaxStepDistance)));
+			for (int step = 0; step < steps && !hitSolid[i]; ++step)
+			{
+				m_Physics.Update(*object, deltaTime / static_cast<float>(steps));
+				hitSolid[i] = TouchesSolid(*object);
+			}
 		}
 		bullet.Age += deltaTime;
 	}
 
-	auto isFinished = [this](const Bullet& bullet)
+	std::size_t index = 0;
+	auto isFinished = [this, &hitSolid, &index](const Bullet& bullet)
 	{
+		const bool touchedSolid = hitSolid[index++];
 		const Engine::GameObject* object = m_Objects.Find(bullet.Id);
-		bool finished = object == nullptr || bullet.Age >= m_Config.Lifetime ||
+		bool finished = object == nullptr || touchedSolid || bullet.Age >= m_Config.Lifetime ||
 		                IsFullyOutsideArena(CenterOf(*object), m_Config.Radius);
 		if (finished && object != nullptr)
 		{

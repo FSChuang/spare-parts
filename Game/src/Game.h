@@ -7,6 +7,7 @@
 #include "Engine/Physics/PhysicsSystem.h"
 
 #include "BulletField.h"
+#include "GameAssets.h"
 #include "NetworkClient.h"
 #include "PeerClient.h"
 #include "PeerEventBridge.h"
@@ -25,15 +26,17 @@ namespace Engine
 	class Renderer;
 }
 
-// Astro rebuild Checkpoint B: a small Astro Party-inspired arena. One fixed 1920x1080 screen
-// (world coordinates are screen coordinates, no camera), ships that fly forward constantly,
-// rotate left/right and shoot bullets, wrap around the arena edges, die when hit, and respawn
-// after a delay with a short invulnerability window. Rendering is primitives only for now.
+// Astro Arena: a small Astro Party-inspired multiplayer arena. One fixed 1920x1080 screen (world
+// coordinates are screen coordinates, no camera): a walled map with a central reactor and four
+// barriers, ships that fly forward constantly, rotate left/right and shoot bullets, die when they
+// are hit or touch a wall or obstacle, and respawn after a delay with a short invulnerability
+// window. There is no wrap-around: the walls are solid and deadly, and bullets are stopped by them.
 //
-// Controls: A/Left rotate left, D/Right rotate right, Space fire.
+// Controls: A/Left rotate left, D/Right rotate right, Space fire; F5/F6/F7 record/stop/play a
+// replay; P pauses and 1/2/3 scale the Timeline (engine keys).
 //
 // Every object is a plain Engine::GameObject in one registry (m_Objects): the local ship, every
-// remote ship, every bullet. Ship-specific state (heading, alive, cooldown, invulnerability) is
+// remote ship, every bullet, and the map's walls and obstacles (static Boundary objects). Ship-specific state (heading, alive, cooldown, invulnerability) is
 // Game-side — see ShipController.h; bullets — see BulletField.h. Ships and bullets are square
 // GameObjects whose circle (radius = half the size) is the collision shape.
 //
@@ -60,7 +63,7 @@ class Game
 public:
 	/// `timeSource` supplies the logical time that stamps every event and drives the ship's
 	/// cooldown/respawn/invulnerability — main.cpp wires it to the game Timeline's GetTime().
-	Game(const std::string& serverEndpoint, std::function<double()> timeSource);
+	Game(const std::string& serverEndpoint, std::function<double()> timeSource, const GameAssets& assets);
 
 	void Update(Engine::InputManager& input, float deltaTime);
 	void Render(Engine::Renderer& renderer);
@@ -71,9 +74,18 @@ private:
 	// Registers a concise stdout line for each of the four event types (manual-run
 	// visibility only; no gameplay depends on it).
 	void SubscribeEventLogging();
+	// Remembers where each ship dies so an explosion can play there (see Render()).
+	void SubscribeExplosions();
 	void UpdateNetworking(float deltaTime);
 
-	void DrawShip(Engine::Renderer& renderer, Engine::Vector2 centre, float heading, Engine::Color bodyColor) const;
+	// Turns the map's walls and obstacles into static Boundary objects in the registry.
+	void CreateArenaSolids();
+
+	// Drawing helpers, called from Render() in painter's order.
+	void DrawBackground(Engine::Renderer& renderer) const;
+	void DrawMap(Engine::Renderer& renderer) const;
+	void DrawShip(Engine::Renderer& renderer, Engine::TextureId texture, Engine::Vector2 centre, float heading) const;
+	void DrawExplosions(Engine::Renderer& renderer, double now) const;
 
 	// This local player's designated spawn centre: a deterministic function of its own
 	// server-assigned PlayerId (before one is known, the first spawn point), so different
@@ -88,6 +100,9 @@ private:
 
 	// A copy of the logical clock (the EventManager keeps its own).
 	std::function<double()> m_TimeSource;
+
+	// The textures the game draws with (handles; the Renderer owns the textures).
+	GameAssets m_Assets;
 
 	Engine::GameObjectRegistry m_Objects;
 	Engine::ObjectId m_LocalShipObjectId;
@@ -116,12 +131,20 @@ private:
 	// Remote ship object -> its last known heading, derived from velocity (presentation only).
 	std::unordered_map<Engine::ObjectId, float> m_RemoteHeadings;
 
+	// Ships that died recently: where, and when (logical time). Each plays one explosion.
+	struct Explosion
+	{
+		Engine::Vector2 Centre;
+		double StartTime;
+	};
+	std::vector<Explosion> m_Explosions;
+
 	// The local ship's event-driven gameplay. Constructed in the constructor body once the ship
 	// object exists; declared LAST so it is destroyed FIRST, unsubscribing its handlers while
 	// m_Events is still alive.
 	std::unique_ptr<ShipController> m_Ship;
 
-	// Gameplay event notifications between peers (death announce + remote death marker).
+	// Gameplay event notifications between peers (death/spawn/shoot announcements and remote life state).
 	// Declared last for the same reason as m_Ship.
 	std::unique_ptr<PeerEventBridge> m_PeerEvents;
 

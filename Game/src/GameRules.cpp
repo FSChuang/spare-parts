@@ -4,8 +4,9 @@
 
 namespace
 {
-	// Distance from the arena edge to a spawn centre.
-	constexpr float SpawnInset = 160.0f;
+	// Distance from the screen edge to a spawn centre: clear of the outer walls (which end 102 px in)
+	// and of every obstacle, with room for a ship to leave along the long axis.
+	constexpr float SpawnInset = 220.0f;
 }
 
 std::size_t SelectSpawnIndex(std::uint32_t playerId, std::size_t spawnCount)

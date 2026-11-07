@@ -63,8 +63,8 @@ int main()
 		Check(bullet->GetSize().X == 10.0f && bullet->GetSize().Y == 10.0f, "Fire_BulletSizeIsTwiceTheRadius");
 		Check(bullet->GetVelocity().X == 200.0f && bullet->GetVelocity().Y == 0.0f, "Fire_HeadingZero_FliesRightAtBulletSpeed");
 		Check(world.Bullets.All()[0].Owner == 42 && world.Bullets.All()[0].Age == 0.0f, "Fire_RecordsOwnerAndStartsAtAgeZero");
-		Check(bullet->HasRender() && !bullet->HasNetworkId() && bullet->GetType() == Engine::ObjectType::Generic,
-		      "Fire_BulletIsAnOrdinaryRenderedGenericObject");
+		Check(!bullet->HasNetworkId() && bullet->HasVelocity() && bullet->GetType() == Engine::ObjectType::Generic,
+		      "Fire_BulletIsAnOrdinaryGenericObjectWithAVelocity");
 	}
 	{
 		World world;
@@ -82,12 +82,12 @@ int main()
 		World world;
 		Engine::ObjectId id = world.Bullets.Fire({ 500.0f, 300.0f }, 0.0f, 1);
 		world.Bullets.Update(0.5f);
-		Check(CenterOf(*world.Objects.Find(id)).X == 600.0f && CenterOf(*world.Objects.Find(id)).Y == 300.0f,
-		      "Update_MovesBulletByVelocityTimesDeltaTime");
+		Check(Near(CenterOf(*world.Objects.Find(id)).X, 600.0f) && Near(CenterOf(*world.Objects.Find(id)).Y, 300.0f),
+		      "Update_MovesBulletByVelocityTimesDeltaTime"); // (moved in several short steps: equal up to rounding)
 		Check(world.Bullets.All()[0].Age == 0.5f, "Update_AgesBulletByDeltaTime");
 
 		world.Bullets.Update(0.0f);
-		Check(CenterOf(*world.Objects.Find(id)).X == 600.0f && world.Bullets.All()[0].Age == 0.5f && world.Bullets.All().size() == 1,
+		Check(Near(CenterOf(*world.Objects.Find(id)).X, 600.0f) && world.Bullets.All()[0].Age == 0.5f && world.Bullets.All().size() == 1,
 		      "Update_ZeroDeltaTime_ChangesNothing");
 	}
 
@@ -127,6 +127,73 @@ int main()
 		Check(world.Bullets.Contains(id), "Arena_BulletAtTheEdge_StillExists");
 		world.Bullets.Update(0.1f); // centre 1940: fully outside
 		Check(!world.Bullets.Contains(id) && world.Objects.Find(id) == nullptr, "Arena_BulletFullyOutside_IsRemoved_NotWrapped");
+	}
+
+	// --- walls and obstacles: a bullet touching a Boundary object is spent, silently ---
+	{
+		World world;
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f }); // a wall x 600..632
+		Engine::ObjectId toward = world.Bullets.Fire({ 500.0f, 300.0f }, 0.0f, 1);   // flies right into it
+		Engine::ObjectId past = world.Bullets.Fire({ 500.0f, 600.0f }, 0.0f, 1);     // flies right below it
+		world.Bullets.Update(0.3f); // 60 px: centre 560, edge 565: not touching yet
+		Check(world.Bullets.Contains(toward) && world.Bullets.Contains(past), "Wall_BulletShortOfTheWall_Remains");
+		world.Bullets.Update(0.1f); // centre 580.. 580+20=580: still short? 560+20 = 580, edge 585
+		world.Bullets.Update(0.1f); // centre 600: touching the wall
+		Check(!world.Bullets.Contains(toward) && world.Objects.Find(toward) == nullptr, "Wall_BulletHittingAWall_IsRemoved");
+		Check(world.Bullets.Contains(past), "Wall_BulletThatMissesTheWall_Remains");
+	}
+	{
+		World world;
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f });
+		world.Objects.Create(Engine::ObjectType::Generic, { 700.0f, 200.0f }, { 32.0f, 300.0f }); // NOT solid
+		Engine::ObjectId bullet = world.Bullets.Fire({ 680.0f, 300.0f }, 0.0f, 1);
+		world.Bullets.Update(0.2f); // passes through the ordinary object
+		Check(world.Bullets.Contains(bullet), "Wall_OnlyBoundaryObjectsStopBullets");
+	}
+	{
+		World world; // an obstacle in the middle of the arena stops a bullet just the same
+		world.Objects.Create(Engine::ObjectType::Boundary, { 900.0f, 500.0f }, { 180.0f, 180.0f });
+		Engine::ObjectId bullet = world.Bullets.Fire({ 700.0f, 590.0f }, 0.0f, 1);
+		for (int i = 0; i < 10 && world.Bullets.Contains(bullet); ++i)
+		{
+			world.Bullets.Update(0.1f);
+		}
+		Check(!world.Bullets.Contains(bullet), "Wall_BulletHittingAnObstacle_IsRemoved");
+	}
+	{
+		World world; // bullets do not bounce or wrap: the one that hit is simply gone, the field is empty
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f });
+		world.Bullets.Fire({ 590.0f, 300.0f }, 0.0f, 1);
+		world.Bullets.Update(0.1f);
+		Check(world.Bullets.All().empty() && world.Objects.Count() == 1, "Wall_NoBounceNoLeftoverObject");
+	}
+	{
+		World world; // a slow frame must not carry a fast bullet THROUGH a thin wall
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f });
+		Engine::ObjectId bullet = world.Bullets.Fire({ 500.0f, 300.0f }, 0.0f, 1);
+		world.Bullets.Update(1.0f); // 200 px in one frame: far past the 32 px wall
+		Check(!world.Bullets.Contains(bullet), "Wall_OneHugeFrame_BulletDoesNotTunnelThroughTheWall");
+	}
+	{
+		World world; // a bullet created inside a wall (e.g. firing with the nose against it) dies at once, even on a zero frame
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f });
+		Engine::ObjectId bullet = world.Bullets.Fire({ 610.0f, 300.0f }, 0.0f, 1);
+		world.Bullets.Update(0.0f);
+		Check(!world.Bullets.Contains(bullet), "Wall_BulletCreatedInsideAWall_DiesEvenOnAZeroFrame");
+	}
+	{
+		World world; // a bullet rebuilt from a peer's Shoot is owned by someone else but meets the same geometry
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f });
+		Engine::ObjectId remoteBullet = world.Bullets.Fire({ 500.0f, 300.0f }, 0.0f, Engine::NoObjectId);
+		world.Bullets.Update(0.6f);
+		Check(!world.Bullets.Contains(remoteBullet), "Wall_AReconstructedBullet_StopsAtTheSameWall");
+	}
+	{
+		World world; // a bullet far from every wall and obstacle is untouched by them (zero dt too)
+		world.Objects.Create(Engine::ObjectType::Boundary, { 600.0f, 200.0f }, { 32.0f, 300.0f });
+		Engine::ObjectId bullet = world.Bullets.Fire({ 300.0f, 300.0f }, 0.0f, 1);
+		world.Bullets.Update(0.0f);
+		Check(world.Bullets.Contains(bullet), "Wall_NoContact_BulletRemains");
 	}
 
 	// --- several bullets are independent ---

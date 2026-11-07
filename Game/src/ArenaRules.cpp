@@ -27,9 +27,9 @@ float NormalizeHeading(float headingRadians)
 	return folded;
 }
 
-float HeadingTowardArenaCentre(Engine::Vector2 position)
+float SpawnHeadingFor(Engine::Vector2 position)
 {
-	return std::atan2(Astro::ArenaHeight / 2.0f - position.Y, Astro::ArenaWidth / 2.0f - position.X);
+	return position.X < Astro::ArenaWidth / 2.0f ? 0.0f : Pi;
 }
 
 bool CirclesOverlap(Engine::Vector2 centerA, float radiusA, Engine::Vector2 centerB, float radiusB)
@@ -40,30 +40,16 @@ bool CirclesOverlap(Engine::Vector2 centerA, float radiusA, Engine::Vector2 cent
 	return dx * dx + dy * dy < radiusSum * radiusSum;
 }
 
-Engine::Vector2 WrapShipCentre(Engine::Vector2 center, float radius)
+bool CircleVsRect(Engine::Vector2 center, float radius, Engine::Vector2 rectPosition, Engine::Vector2 rectSize)
 {
-	const float wrapWidth = Astro::ArenaWidth + 2.0f * radius;
-	const float wrapHeight = Astro::ArenaHeight + 2.0f * radius;
+	// The point of the rectangle nearest the centre (the centre itself if it is inside).
+	float nearestX = std::fmax(rectPosition.X, std::fmin(center.X, rectPosition.X + rectSize.X));
+	float nearestY = std::fmax(rectPosition.Y, std::fmin(center.Y, rectPosition.Y + rectSize.Y));
+	float dx = center.X - nearestX;
+	float dy = center.Y - nearestY;
 
-	if (center.X < -radius)
-	{
-		center.X += wrapWidth;
-	}
-	else if (center.X > Astro::ArenaWidth + radius)
-	{
-		center.X -= wrapWidth;
-	}
-
-	if (center.Y < -radius)
-	{
-		center.Y += wrapHeight;
-	}
-	else if (center.Y > Astro::ArenaHeight + radius)
-	{
-		center.Y -= wrapHeight;
-	}
-
-	return center;
+	// Centre inside the rectangle: distance 0, so it overlaps for any positive radius.
+	return dx * dx + dy * dy < radius * radius;
 }
 
 bool IsFullyOutsideArena(Engine::Vector2 center, float radius)

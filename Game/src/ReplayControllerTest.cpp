@@ -1,4 +1,4 @@
-// Tests for ReplayController (Astro rebuild Checkpoint D): recording local ship + bullet samples,
+// Tests for ReplayController: recording local ship + bullet samples,
 // playback, the live-state restore, and everything playback must keep OUT of the live game.
 // Uses the REAL controller, the REAL Engine::ReplayRecorder, ShipController, BulletField,
 // PeerEventBridge and GameObjects, an Engine::EventManager on a fake clock, and a Scene::Frame()
@@ -84,7 +84,7 @@ namespace
 
 			Controller = std::make_unique<ShipController>(Events, Objects, Bullets, ShipId, TestShip,
 			                                              [this] { return NextSpawn; }, [this] { return Now; });
-			Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, ShipId, [this] { return Now; },
+			Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, ShipId,
 			                                          [this](const Engine::NetworkEvent& event) { Sent.push_back(event); });
 			Controller->SetShotListener([this](Engine::Vector2 origin, float heading) { Bridge->AnnounceShot(origin, heading); });
 			Replay = std::make_unique<ReplayController>(Events, Objects, Bullets, *Controller, *Bridge, ShipId,
@@ -113,8 +113,8 @@ namespace
 			{
 				Controller->ApplySteering(dt);
 				Physics.Update(Ship(), dt);
-				Controller->WrapAroundArena();
 				Bullets.Update(dt);
+				Controller->DetectSolidHits();
 				Controller->DetectBulletHits();
 				Events.DispatchDue();
 			}
@@ -655,7 +655,7 @@ int main()
 		Check(Near(scene.Controller->Heading(), 0.0f), "Gate_LiveRotation_DoesNotTurnTheReplayedShip");
 		Engine::Vector2 velocityBefore = scene.Ship().GetVelocity();
 		scene.Controller->ApplySteering(0.5f);
-		scene.Controller->WrapAroundArena();
+		scene.Controller->DetectSolidHits();
 		Check(scene.Ship().GetVelocity().X == velocityBefore.X && scene.Ship().GetVelocity().Y == velocityBefore.Y,
 		      "Gate_Steering_DoesNotRunDuringPlayback");
 		ShootShip(scene);

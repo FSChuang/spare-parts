@@ -15,8 +15,8 @@
 /// different points with no server involvement. `spawnCount` must be greater than zero.
 std::size_t SelectSpawnIndex(std::uint32_t playerId, std::size_t spawnCount);
 
-/// The arena has four spawn points, one near each corner, inset so a fresh ship is fully on
-/// screen.
+/// The arena has four spawn points, one near each corner of the playfield, each clear of every wall
+/// and obstacle (ArenaMap.h; a test checks it).
 constexpr std::size_t ArenaSpawnCount = 4;
 
 /// The centre of spawn point `index` (0..ArenaSpawnCount-1): top-left, top-right,

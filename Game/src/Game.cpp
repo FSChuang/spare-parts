@@ -3,13 +3,16 @@
 #include "Engine/Input/InputManager.h"
 #include "Engine/Renderer/Renderer.h"
 
+#include "ArenaMap.h"
 #include "ArenaRules.h"
 #include "GameRules.h"
 #include "NetworkRate.h"
 #include "NetworkState.h"
+#include "VisualRules.h"
 
 #include <SDL3/SDL_scancode.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -22,21 +25,24 @@ namespace
 	// A ship (local or remote) is a square object whose inscribed circle is its collision shape.
 	constexpr Engine::Vector2 ShipSize{ 2.0f * Astro::ShipRadius, 2.0f * Astro::ShipRadius };
 
-	constexpr Engine::Color LocalShipColor{ 0, 170, 255, 255 };
-	constexpr Engine::Color RemoteShipColor{ 255, 150, 40, 255 };
-	// A remote ship that has died shows this marker (a white square, a bit larger than the
-	// ship) for PeerEventBridge::MarkDuration, then nothing until its Spawn arrives. Purely
-	// presentational, never networked.
-	constexpr Engine::Color RemoteDeathMarkerColor{ 255, 255, 255, 255 };
-	constexpr float RemoteDeathMarkerSize = 3.0f * Astro::ShipRadius;
-	constexpr Engine::Color NoseColor{ 255, 255, 255, 255 };
-
-	// The nose marker: a small square centred on the ship's rim, so rotation is obvious.
-	constexpr float NoseSize = 14.0f;
-
-	// An invulnerable ship blinks: alternating full and dim alpha.
+	// An invulnerable ship blinks: it is drawn for half of every period and skipped for the other half.
 	constexpr double BlinkPeriodSeconds = 0.2;
-	constexpr std::uint8_t BlinkDimAlpha = 70;
+
+	// The playfield floor and its faint grid (drawn over the star background, under the walls).
+	constexpr Engine::Color FloorColor{ 10, 14, 38, 205 };
+	constexpr Engine::Color GridColor{ 70, 100, 170, 34 };
+	constexpr float GridSpacing = 120.0f;
+	constexpr float GridLineWidth = 2.0f;
+
+	// Wall and obstacle artwork: a 32x32 tile repeated over each solid, plus a bright rim so the
+	// edge of every solid reads clearly. Walls and obstacles get different rim colors.
+	constexpr float WallTilePixels = 32.0f;
+	constexpr float RimWidth = 3.0f;
+	constexpr Engine::Color WallRimColor{ 80, 210, 255, 255 };
+	constexpr Engine::Color ObstacleRimColor{ 255, 190, 80, 255 };
+
+	// The star background is a tile of this size, repeated across the whole screen.
+	constexpr float StarTilePixels = 512.0f;
 
 	// Below this squared speed a remote ship is considered stopped, so noise cannot spin its heading.
 	constexpr float MinimumHeadingSpeedSquared = 1.0f;
@@ -50,20 +56,16 @@ namespace
 	constexpr SDL_Scancode ReplayStopKey = SDL_SCANCODE_F6;
 	constexpr SDL_Scancode ReplayPlayKey = SDL_SCANCODE_F7;
 
-	// While a replay plays, the local ship and the replayed bullets are drawn in these colors, so
-	// it is obvious that what is on screen is the recording and not live play.
-	constexpr Engine::Color ReplayShipColor{ 0, 220, 120, 255 };
-	constexpr Engine::Color ReplayBulletColor{ 150, 255, 200, 255 };
-
 	// Local-player sentinel network id before NetworkClient's handshake has assigned a
 	// real one (Protocol.h: PlayerId 0 is reserved "unassigned"). The local ship always has a
 	// network-id property, so ToPlayerState() never needs a special case for "not connected yet".
 	constexpr std::uint32_t UnassignedNetworkId = 0;
 }
 
-Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource)
+Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource, const GameAssets& assets)
 	: m_Events(timeSource),
 	  m_TimeSource(std::move(timeSource)),
+	  m_Assets(assets),
 	  m_Physics(0.0f),
 	  m_Network(serverEndpoint),
 	  // Set in the past by exactly one interval, so the very first Update() call
@@ -73,14 +75,16 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 	  m_LastServerRefreshTime(std::chrono::steady_clock::now() - ServerRefreshInterval),
 	  m_Bullets(m_Objects, m_Physics, BulletConfig{ Astro::BulletSpeed, Astro::BulletLifetime, Astro::BulletRadius })
 {
+	CreateArenaSolids();
+
 	Engine::GameObject& ship = m_Objects.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, ShipSize);
 	SetCenter(ship, SelectSpawnCentre());
-	ship.SetRender(LocalShipColor);
 	ship.SetVelocity({ 0.0f, 0.0f });
 	ship.SetNetworkId(UnassignedNetworkId);
 	m_LocalShipObjectId = ship.GetId();
 
 	SubscribeEventLogging();
+	SubscribeExplosions();
 
 	m_Ship = std::make_unique<ShipController>(
 	    m_Events, m_Objects, m_Bullets, m_LocalShipObjectId,
@@ -96,7 +100,7 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 	// which only exists once the server handshake has completed — before that there is nobody to
 	// tell. (PublishEvent just queues; the PeerClient worker does the sending.)
 	m_PeerEvents = std::make_unique<PeerEventBridge>(
-	    m_Events, m_Objects, m_Bullets, m_LocalShipObjectId, m_TimeSource,
+	    m_Events, m_Objects, m_Bullets, m_LocalShipObjectId,
 	    [this](const Engine::NetworkEvent& event)
 	    {
 		    if (m_PeerClient)
@@ -110,6 +114,20 @@ Game::Game(const std::string& serverEndpoint, std::function<double()> timeSource
 
 	m_Replay = std::make_unique<ReplayController>(m_Events, m_Objects, m_Bullets, *m_Ship, *m_PeerEvents,
 	                                              m_LocalShipObjectId, m_TimeSource);
+}
+
+void Game::CreateArenaSolids()
+{
+	// Every wall and obstacle becomes a static Boundary object, so touching one is an ordinary
+	// Collision event naming it, and BulletField can find them. No render property: they are
+	// drawn from the map data (DrawMap), not through DrawObject.
+	for (const std::vector<SolidRect>* group : { &ArenaWalls(), &ArenaObstacles() })
+	{
+		for (const SolidRect& rect : *group)
+		{
+			m_Objects.Create(Engine::ObjectType::Boundary, rect.Position, rect.Size);
+		}
+	}
 }
 
 Engine::Vector2 Game::SelectSpawnCentre() const
@@ -135,20 +153,21 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	//  LIVE (not replaying):
 	//  4. ApplySteering     rotate by the intent, set the forward velocity (zero if dead)
 	//  5. physics           integrate the ship's velocity (zero gravity)
-	//  6. wrap              a ship that fully left the arena reappears on the opposite side
-	//  7. bullets           move, age, expire (no wrap)
-	//  8. hit detection     a bullet overlapping the ship raises a Collision event (kills nothing)
-	//  9. DispatchDue #2    the whole chain runs now, in one call: Collision -> Death. The Spawn it
+	//  6. bullets           move in short steps, age, and are spent on a wall/obstacle or at the
+	//                       end of their life
+	//  7. hit detection     the ship touching a wall/obstacle, or a bullet overlapping it, raises a
+	//                       Collision event (detection kills nothing)
+	//  8. DispatchDue #2    the whole chain runs now, in one call: Collision -> Death. The Spawn it
 	//                       schedules is `RespawnDelay` in the future, so it is NOT due here. A death
 	//                       never waits for the next frame, and networking reads the final state
-	//  (While a replay PLAYS, 4-9 are skipped: the recorded frames own the ship and its bullets,
+	//  (While a replay PLAYS, 4-8 are skipped: the recorded frames own the ship and its bullets,
 	//   and the live BulletField is not touched at all — it is frozen exactly as it was.)
 	//
-	// 10. networking        publishes this frame's final ship state (the saved live state, not the
+	//  9. networking        publishes this frame's final ship state (the saved live state, not the
 	//                       replay, while one plays); remote players stay live
-	// 11. UpdatePlayback    shows the recorded frame for the elapsed playback time, and ends
+	// 10. UpdatePlayback    shows the recorded frame for the elapsed playback time, and ends
 	//                       playback (restoring the live ship) when the span is over
-	// 12. CaptureFrame      while recording, stores this frame's final state
+	// 11. CaptureFrame      while recording, stores this frame's final state
 	//
 	// A frame with deltaTime == 0 (the Timeline reads whole milliseconds) changes no heading and
 	// moves nothing, but still delivers any due events.
@@ -161,9 +180,9 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	{
 		m_Ship->ApplySteering(deltaTime);
 		m_Physics.Update(*m_Objects.Find(m_LocalShipObjectId), deltaTime);
-		m_Ship->WrapAroundArena();
 
 		m_Bullets.Update(deltaTime);
+		m_Ship->DetectSolidHits();
 		m_Ship->DetectBulletHits();
 		m_Events.DispatchDue();
 	}
@@ -172,89 +191,196 @@ void Game::Update(Engine::InputManager& input, float deltaTime)
 	// state — never a stale pre-respawn position.
 	UpdateNetworking(deltaTime);
 
+	// Forget explosions that have finished playing.
+	const double now = m_TimeSource();
+	m_Explosions.erase(std::remove_if(m_Explosions.begin(), m_Explosions.end(),
+	                                  [now](const Explosion& explosion) { return ExplosionFrameAt(now - explosion.StartTime) < 0 && now >= explosion.StartTime; }),
+	                   m_Explosions.end());
+
 	m_Replay->UpdatePlayback();
 	m_Replay->CaptureFrame();
 }
 
 void Game::Render(Engine::Renderer& renderer)
 {
+	// Painter's order, back to front (no layers: each call just draws over what came before):
+	//   1. stars         the space background, tiled over the whole screen
+	//   2. floor + grid  the playfield inside the walls
+	//   3. map           walls, then obstacles
+	//   4. bullets       live ones, or — while a replay plays — the replay's recorded ones
+	//   5. ships         remote ships, then the local one on top (green ghost during a replay)
+	//   6. explosions    over everything, where ships died
 	const double now = m_TimeSource();
 	const bool replaying = m_Replay->IsPlaying();
 
-	for (auto& [id, object] : m_Objects)
+	DrawBackground(renderer);
+	DrawMap(renderer);
+
+	const float bulletSize = Astro::BulletSpriteSize;
+	auto drawBullet = [&](Engine::Vector2 centre)
 	{
-		if (id == m_LocalShipObjectId)
+		renderer.DrawSprite(m_Assets.Bullet, { centre.X - bulletSize / 2.0f, centre.Y - bulletSize / 2.0f },
+		                    { bulletSize, bulletSize });
+	};
+	if (replaying)
+	{
+		// The recorded bullets: bare positions from the sample, never live objects. (The live
+		// bullets are frozen and not drawn.)
+		for (const ReplayBullet& bullet : m_Replay->CurrentSample().Bullets)
 		{
-			if (!m_Ship->IsAlive())
-			{
-				continue; // a dead ship is not drawn (while replaying: the recorded ship is dead)
-			}
-
-			// The ship object holds the recorded pose while a replay plays, so it is drawn the same
-			// way; only its color and where the "invulnerable" flag comes from differ.
-			Engine::Color color = replaying ? ReplayShipColor : LocalShipColor;
-			bool invulnerable = replaying ? m_Replay->CurrentSample().Invulnerable : m_Ship->IsInvulnerable();
-			if (invulnerable && std::fmod(now, BlinkPeriodSeconds) < BlinkPeriodSeconds / 2.0)
-			{
-				color.A = BlinkDimAlpha;
-			}
-			DrawShip(renderer, CenterOf(object), m_Ship->Heading(), color);
+			drawBullet(bullet.Centre);
 		}
-		else if (object.HasNetworkId())
+	}
+	else
+	{
+		for (const Bullet& bullet : m_Bullets.All())
 		{
-			if (!m_PeerEvents->IsRemoteAlive(id))
+			if (const Engine::GameObject* object = m_Objects.Find(bullet.Id))
 			{
-				// Dead until its Spawn arrives: a short marker, then nothing.
-				if (m_PeerEvents->IsDeathMarkerActive(id))
-				{
-					Engine::GameObject marker(0, Engine::ObjectType::Generic, { 0.0f, 0.0f },
-					                          { RemoteDeathMarkerSize, RemoteDeathMarkerSize });
-					SetCenter(marker, CenterOf(object));
-					marker.SetRender(RemoteDeathMarkerColor);
-					renderer.DrawObject(marker);
-				}
-				continue;
+				drawBullet(CenterOf(*object));
 			}
-
-			auto heading = m_RemoteHeadings.find(id);
-			DrawShip(renderer, CenterOf(object), heading != m_RemoteHeadings.end() ? heading->second : 0.0f,
-			         RemoteShipColor);
-		}
-		else if (!replaying)
-		{
-			renderer.DrawObject(object); // a live bullet (hidden while a replay plays)
 		}
 	}
 
-	if (replaying)
+	for (auto& [id, object] : m_Objects)
 	{
-		// The recorded bullets: bare positions from the sample, never live objects.
-		const float size = 2.0f * Astro::BulletRadius;
-		for (const ReplayBullet& bullet : m_Replay->CurrentSample().Bullets)
+		if (id == m_LocalShipObjectId || !object.HasNetworkId() || !m_PeerEvents->IsRemoteAlive(id))
 		{
-			Engine::GameObject shot(0, Engine::ObjectType::Generic, { 0.0f, 0.0f }, { size, size });
-			SetCenter(shot, bullet.Centre);
-			shot.SetRender(ReplayBulletColor);
-			renderer.DrawObject(shot);
+			continue; // not a remote ship, or one that is dead (hidden until its Spawn arrives)
 		}
+
+		auto heading = m_RemoteHeadings.find(id);
+		DrawShip(renderer, m_Assets.Ships[ShipVariantFor(object.GetNetworkId())], CenterOf(object),
+		         heading != m_RemoteHeadings.end() ? heading->second : 0.0f);
+	}
+
+	if (m_Ship->IsAlive()) // a dead ship is not drawn (while replaying: the recorded ship is dead)
+	{
+		const Engine::GameObject& local = *m_Objects.Find(m_LocalShipObjectId);
+		bool invulnerable = replaying ? m_Replay->CurrentSample().Invulnerable : m_Ship->IsInvulnerable();
+		bool blinkedOut = invulnerable && std::fmod(now, BlinkPeriodSeconds) >= BlinkPeriodSeconds / 2.0;
+		if (!blinkedOut)
+		{
+			Engine::TextureId texture =
+			    replaying ? m_Assets.ReplayShip : m_Assets.Ships[ShipVariantFor(local.GetNetworkId())];
+			DrawShip(renderer, texture, CenterOf(local), m_Ship->Heading());
+		}
+	}
+
+	DrawExplosions(renderer, now);
+}
+
+void Game::DrawShip(Engine::Renderer& renderer, Engine::TextureId texture, Engine::Vector2 centre, float heading) const
+{
+	// Gameplay heading is untouched; only the drawing adds the artwork's quarter-turn.
+	const float size = Astro::ShipSpriteSize;
+	renderer.DrawSprite(texture, { centre.X - size / 2.0f, centre.Y - size / 2.0f }, { size, size },
+	                    ShipSpriteRotation(heading));
+}
+
+void Game::DrawBackground(Engine::Renderer& renderer) const
+{
+	for (float y = 0.0f; y < Astro::ArenaHeight; y += StarTilePixels)
+	{
+		for (float x = 0.0f; x < Astro::ArenaWidth; x += StarTilePixels)
+		{
+			renderer.DrawSprite(m_Assets.Stars, { x, y }, { StarTilePixels, StarTilePixels });
+		}
+	}
+
+	auto fill = [&renderer](Engine::Vector2 position, Engine::Vector2 size, Engine::Color color)
+	{
+		Engine::GameObject rect(0, Engine::ObjectType::Generic, position, size);
+		rect.SetRender(color);
+		renderer.DrawObject(rect);
+	};
+
+	const SolidRect floor = ArenaPlayfield();
+	fill(floor.Position, floor.Size, FloorColor);
+	for (float x = floor.Position.X + GridSpacing; x < floor.Position.X + floor.Size.X; x += GridSpacing)
+	{
+		fill({ x - GridLineWidth / 2.0f, floor.Position.Y }, { GridLineWidth, floor.Size.Y }, GridColor);
+	}
+	for (float y = floor.Position.Y + GridSpacing; y < floor.Position.Y + floor.Size.Y; y += GridSpacing)
+	{
+		fill({ floor.Position.X, y - GridLineWidth / 2.0f }, { floor.Size.X, GridLineWidth }, GridColor);
 	}
 }
 
-void Game::DrawShip(Engine::Renderer& renderer, Engine::Vector2 centre, float heading, Engine::Color bodyColor) const
+void Game::DrawMap(Engine::Renderer& renderer) const
 {
-	Engine::GameObject body(0, Engine::ObjectType::Generic, { 0.0f, 0.0f }, ShipSize);
-	SetCenter(body, centre);
-	body.SetRender(bodyColor);
-	renderer.DrawObject(body);
+	auto drawSolid = [&](const SolidRect& rect, Engine::Color rim)
+	{
+		// The tile, repeated; the last tile in a row/column is cropped to fit (the tile is drawn 1:1,
+		// so a crop of w x h screen units is a crop of w x h texture pixels).
+		for (float y = 0.0f; y < rect.Size.Y; y += WallTilePixels)
+		{
+			for (float x = 0.0f; x < rect.Size.X; x += WallTilePixels)
+			{
+				float w = std::fmin(WallTilePixels, rect.Size.X - x);
+				float h = std::fmin(WallTilePixels, rect.Size.Y - y);
+				renderer.DrawSprite(m_Assets.Wall, { rect.Position.X + x, rect.Position.Y + y }, { w, h }, 0.0f,
+				                    Engine::SourceRect{ 0.0f, 0.0f, w, h });
+			}
+		}
 
-	// The nose sits on the rim in the heading direction.
-	Engine::Vector2 forward = ForwardOf(heading);
-	Engine::GameObject nose(0, Engine::ObjectType::Generic, { 0.0f, 0.0f }, { NoseSize, NoseSize });
-	SetCenter(nose, { centre.X + forward.X * Astro::ShipRadius, centre.Y + forward.Y * Astro::ShipRadius });
-	Engine::Color noseColor = NoseColor;
-	noseColor.A = bodyColor.A;
-	nose.SetRender(noseColor);
-	renderer.DrawObject(nose);
+		// The bright rim, on the outside edge of the collision rectangle.
+		auto edge = [&](Engine::Vector2 position, Engine::Vector2 size)
+		{
+			Engine::GameObject bar(0, Engine::ObjectType::Generic, position, size);
+			bar.SetRender(rim);
+			renderer.DrawObject(bar);
+		};
+		edge(rect.Position, { rect.Size.X, RimWidth });
+		edge({ rect.Position.X, rect.Position.Y + rect.Size.Y - RimWidth }, { rect.Size.X, RimWidth });
+		edge(rect.Position, { RimWidth, rect.Size.Y });
+		edge({ rect.Position.X + rect.Size.X - RimWidth, rect.Position.Y }, { RimWidth, rect.Size.Y });
+	};
+
+	for (const SolidRect& wall : ArenaWalls())
+	{
+		drawSolid(wall, WallRimColor);
+	}
+	for (const SolidRect& obstacle : ArenaObstacles())
+	{
+		drawSolid(obstacle, ObstacleRimColor);
+	}
+}
+
+void Game::DrawExplosions(Engine::Renderer& renderer, double now) const
+{
+	const float size = Astro::ExplosionDrawSize;
+	for (const Explosion& explosion : m_Explosions)
+	{
+		int frame = ExplosionFrameAt(now - explosion.StartTime);
+		if (frame < 0)
+		{
+			continue;
+		}
+
+		const float pixels = Astro::ExplosionFramePixels;
+		renderer.DrawSprite(m_Assets.Explosion, { explosion.Centre.X - size / 2.0f, explosion.Centre.Y - size / 2.0f },
+		                    { size, size }, 0.0f,
+		                    Engine::SourceRect{ pixels * static_cast<float>(frame), 0.0f, pixels, pixels });
+	}
+}
+
+void Game::SubscribeExplosions()
+{
+	// A ship that dies — the local one, a remote one, or the local one in a replay — explodes where
+	// it was. The Death event is the one signal for all three (the bridge raises it for remote
+	// players too). Presentation only: nothing here touches gameplay.
+	m_EventLogSubscriptions.emplace_back(
+	    m_Events, Engine::EventType::Death,
+	    [this](const Engine::Event& event)
+	    {
+		    const auto& death = std::get<Engine::DeathEventData>(event.Payload);
+		    const Engine::GameObject* subject = m_Objects.Find(death.Subject);
+		    if (subject != nullptr && subject->GetType() == Engine::ObjectType::Player)
+		    {
+			    m_Explosions.push_back({ CenterOf(*subject), event.Timestamp });
+		    }
+	    });
 }
 
 void Game::PollInputEvents(Engine::InputManager& input)
@@ -455,7 +581,6 @@ void Game::UpdateNetworking(float deltaTime)
 		{
 			Engine::GameObject& created =
 			    m_Objects.Create(Engine::ObjectType::Player, { state.PositionX, state.PositionY }, ShipSize);
-			created.SetRender(RemoteShipColor);
 			created.SetVelocity({ state.VelocityX, state.VelocityY });
 			created.SetNetworkId(id);
 			remotePlayer = &created;

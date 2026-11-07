@@ -77,10 +77,12 @@ namespace
 
 			RemoteAId = MakeRemote(RemoteNetworkIdA, { 1200.0f, 800.0f });
 			RemoteBId = MakeRemote(RemoteNetworkIdB, { 1500.0f, 200.0f });
+			// A wall (x 1100..1132, y 300..800): solid map geometry every client has.
+			WallId = Objects.Create(Engine::ObjectType::Boundary, { 1100.0f, 300.0f }, { 32.0f, 500.0f }).GetId();
 
 			Controller = std::make_unique<ShipController>(Events, Objects, Bullets, PlayerId, TestShip,
 			                                              [] { return SpawnCentre; }, [this] { return Now; });
-			Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, PlayerId, [this] { return Now; },
+			Bridge = std::make_unique<PeerEventBridge>(Events, Objects, Bullets, PlayerId,
 			                                          [this](const Engine::NetworkEvent& event) { Sent.push_back(event); });
 			Controller->SetShotListener([this](Engine::Vector2 origin, float heading) { Bridge->AnnounceShot(origin, heading); });
 
@@ -162,6 +164,7 @@ namespace
 		Engine::ObjectId PlayerId = 0;
 		Engine::ObjectId RemoteAId = 0;
 		Engine::ObjectId RemoteBId = 0;
+		Engine::ObjectId WallId = 0;
 
 		std::vector<Engine::NetworkEvent> Sent;
 		std::vector<Engine::Event> SeenDeath;
@@ -208,50 +211,37 @@ int main()
 		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId), "RemoteDeath_AppliedOnDispatch");
 	}
 
-	// ======== Persistent remote death; the marker is only a visual ========
+	// ======== Persistent remote death: only a Spawn ever brings a player back ========
 	{
 		Scene scene;
 		scene.Now = 10.0;
-		Check(scene.Bridge->IsRemoteAlive(scene.RemoteAId) && !scene.Bridge->IsDeathMarkerActive(scene.RemoteAId),
-		      "Life_DiscoveredPeer_InitiallyAliveWithNoMarker");
+		Check(scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_DiscoveredPeer_InitiallyAlive");
 		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdA));
 		scene.Events.DispatchDue();
-		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId) && scene.Bridge->IsDeathMarkerActive(scene.RemoteAId),
-		      "Life_Death_DeadWithAMarker");
-		scene.Now = 10.0 + PeerEventBridge::MarkDuration - 0.001;
-		Check(scene.Bridge->IsDeathMarkerActive(scene.RemoteAId), "Life_MarkerStillShowsJustBeforeItExpires");
-		scene.Now = 10.0 + PeerEventBridge::MarkDuration;
-		Check(!scene.Bridge->IsDeathMarkerActive(scene.RemoteAId), "Life_MarkerExpiresAfterMarkDuration");
-		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_AfterTheMarkerExpires_StillDeadNotAliveAgain");
-		scene.Now = 1000.0; // a long time later: still no timer-driven revival
+		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_Death_Dead");
+		scene.Now = 11.5; // longer than any explosion
+		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_LongAfterTheExplosion_StillDeadNotAliveAgain");
+		scene.Now = 1000.0; // a very long time later: still no timer-driven revival
 		scene.Bridge->PruneRemoved();
-		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_NoTimerEverRevivesAPlayer");
-	}
-	{
-		Scene scene; // the marker is measured from the receiver-local event time, and a frozen clock holds it
-		scene.Now = 20.0;
-		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdA));
-		scene.Events.DispatchDue();
 		for (int i = 0; i < 100; ++i)
 		{
 			scene.Events.DispatchDue();
 		}
-		Check(scene.Bridge->IsDeathMarkerActive(scene.RemoteAId), "Life_FrozenClock_MarkerHolds");
-		scene.Now = 20.6;
-		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdA)); // died again
+		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_NoTimerEverRevivesAPlayer");
+		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdA)); // died again: still dead, still one entry
 		scene.Events.DispatchDue();
-		scene.Now = 21.2; // past the first marker's end, inside the second's
-		Check(scene.Bridge->IsDeathMarkerActive(scene.RemoteAId), "Life_AFurtherDeathRestartsTheMarker");
+		scene.Bridge->HandleNetworkEvent(Scene::SpawnOf(RemoteNetworkIdA));
+		scene.Events.DispatchDue();
+		Check(scene.Bridge->IsRemoteAlive(scene.RemoteAId), "Life_OneSpawnRevivesEvenAfterTwoDeaths");
 	}
 	{
-		Scene scene; // the marker window is measured from the receiver's timestamp, not dispatch time
+		Scene scene; // the event is stamped with the receiver's logical time at raise, not dispatch time
 		scene.Now = 42.0;
 		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdA));
 		scene.Now = 50.0;
 		scene.Events.DispatchDue();
 		Check(scene.SeenDeath.size() == 1 && scene.SeenDeath[0].Timestamp == 42.0,
 		      "Restamp_EventCarriesReceiversLogicalTimeAtRaise");
-		Check(!scene.Bridge->IsDeathMarkerActive(scene.RemoteAId), "Restamp_MarkerMeasuredFromTheReceiverTimestamp");
 	}
 
 	// ======== Remote Spawn ========
@@ -262,8 +252,7 @@ int main()
 		bool handled = scene.Bridge->HandleNetworkEvent(Scene::SpawnOf(RemoteNetworkIdA));
 		Check(handled && !scene.Bridge->IsRemoteAlive(scene.RemoteAId), "RemoteSpawn_QueuedNotAppliedUntilDispatch");
 		scene.Events.DispatchDue();
-		Check(scene.Bridge->IsRemoteAlive(scene.RemoteAId) && !scene.Bridge->IsDeathMarkerActive(scene.RemoteAId),
-		      "RemoteSpawn_BringsThePlayerBackAndClearsTheMarker");
+		Check(scene.Bridge->IsRemoteAlive(scene.RemoteAId), "RemoteSpawn_BringsThePlayerBack");
 		Check(scene.SeenSpawn.size() == 1 && std::get<Engine::SpawnEventData>(scene.SeenSpawn[0].Payload).Subject == scene.RemoteAId,
 		      "RemoteSpawn_IsASpawnEventAboutTheRemoteObject");
 		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdA));
@@ -554,6 +543,43 @@ int main()
 		scene.Events.Raise(Engine::SpawnEventData{ bullet, { 900.0f, 900.0f } });
 		scene.Events.DispatchDue();
 		Check(scene.Sent.empty() && scene.Controller->IsAlive(), "NonNetworkedSubject_IsNeitherTrackedNorAnnounced");
+	}
+
+	// ======== Walls: the same geometry on every client ========
+	{
+		Scene scene; // a rebuilt remote bullet is stopped by the wall, raises no Death, and sends nothing
+		scene.StartLocalShip();
+		scene.Bridge->HandleNetworkEvent(Scene::ShootBy(RemoteNetworkIdA, 900.0f, 500.0f, 0.0f)); // flies right at the wall
+		Require(scene.Bullets.All().size() == 1, "Map_RemoteBullet_Exists");
+		scene.Bullets.Update(0.5f); // 100 px: x=1000, short of the wall
+		Check(scene.Bullets.All().size() == 1, "Map_RemoteBullet_FliesUntilItMeetsTheWall");
+		scene.Bullets.Update(0.5f); // x=1100: touching it
+		Check(scene.Bullets.All().empty(), "Map_RemoteBullet_IsRemovedByTheWall");
+		scene.HitDetectionFrame();
+		Check(scene.SeenDeath.empty() && scene.SeenCollision.empty() && scene.Controller->IsAlive() && scene.Sent.empty(),
+		      "Map_ABulletHittingAWall_RaisesNoDeathNoCollisionAndNoNetworkEvent");
+	}
+	{
+		Scene scene; // a local ship flying into the wall dies through the normal chain and the death is announced once
+		scene.StartLocalShip();
+		SetCenter(scene.Ship(), { 1090.0f, 540.0f }); // overlapping the wall
+		scene.Controller->BeginFrame();
+		scene.Controller->DetectSolidHits();
+		scene.Events.DispatchDue();
+		Check(scene.SeenCollision.size() == 1 && scene.SeenDeath.size() == 1 && !scene.Controller->IsAlive(),
+		      "Map_WallCollision_ThenLocalDeath");
+		Check(scene.Sent.size() == 1 && scene.Sent[0].Kind == Engine::NetworkEventKind::Death && scene.Sent[0].SourcePlayerId == LocalNetworkId,
+		      "Map_WallDeath_AnnouncedToPeersExactlyOnce");
+		scene.Now += 2.0;
+		scene.Events.DispatchDue();
+		Check(scene.Controller->IsAlive() && scene.Sent.size() == 2 && scene.Sent[1].Kind == Engine::NetworkEventKind::Spawn,
+		      "Map_WallDeath_ThenTheRespawnIsAnnounced");
+	}
+	{
+		Scene scene; // a remote player's wall death (a Death notification) behaves like any other remote death
+		scene.Bridge->HandleNetworkEvent(Scene::DeathOf(RemoteNetworkIdB));
+		scene.Events.DispatchDue();
+		Check(!scene.Bridge->IsRemoteAlive(scene.RemoteBId) && scene.Sent.empty(), "Map_RemoteWallDeath_ShowsDeadAndIsNotRebroadcast");
 	}
 
 	if (g_Failures == 0)

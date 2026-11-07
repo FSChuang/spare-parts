@@ -6,12 +6,11 @@
 
 PeerEventBridge::PeerEventBridge(Engine::EventManager& events, Engine::GameObjectRegistry& objects,
                                  BulletField& bullets, Engine::ObjectId localShipObjectId,
-                                 std::function<double()> timeSource, NetworkSink sendToPeers)
+                                 NetworkSink sendToPeers)
 	: m_Events(events),
 	  m_Objects(objects),
 	  m_Bullets(bullets),
 	  m_LocalShipObjectId(localShipObjectId),
-	  m_TimeSource(std::move(timeSource)),
 	  m_SendToPeers(std::move(sendToPeers))
 {
 	m_DeathSubscription = Engine::ScopedSubscription(m_Events, Engine::EventType::Death,
@@ -111,7 +110,7 @@ void PeerEventBridge::OnDeath(const Engine::Event& event)
 	Engine::PlayerId playerId = NetworkIdOf(death.Subject);
 	if (playerId != 0)
 	{
-		m_DeadSince[playerId] = event.Timestamp;
+		m_Dead.insert(playerId);
 	}
 }
 
@@ -129,7 +128,7 @@ void PeerEventBridge::OnSpawn(const Engine::Event& event)
 	Engine::PlayerId playerId = NetworkIdOf(spawn.Subject);
 	if (playerId != 0)
 	{
-		m_DeadSince.erase(playerId);
+		m_Dead.erase(playerId);
 	}
 }
 
@@ -145,19 +144,13 @@ void PeerEventBridge::SetRemoteShootsDiscarded(bool discarded)
 
 bool PeerEventBridge::IsRemoteAlive(Engine::ObjectId remoteObjectId) const
 {
-	return m_DeadSince.find(NetworkIdOf(remoteObjectId)) == m_DeadSince.end();
-}
-
-bool PeerEventBridge::IsDeathMarkerActive(Engine::ObjectId remoteObjectId) const
-{
-	auto it = m_DeadSince.find(NetworkIdOf(remoteObjectId));
-	return it != m_DeadSince.end() && m_TimeSource() < it->second + MarkDuration;
+	return m_Dead.find(NetworkIdOf(remoteObjectId)) == m_Dead.end();
 }
 
 void PeerEventBridge::PruneRemoved()
 {
-	for (auto it = m_DeadSince.begin(); it != m_DeadSince.end();)
+	for (auto it = m_Dead.begin(); it != m_Dead.end();)
 	{
-		it = m_Objects.FindByNetworkId(it->first) == nullptr ? m_DeadSince.erase(it) : std::next(it);
+		it = m_Objects.FindByNetworkId(*it) == nullptr ? m_Dead.erase(it) : std::next(it);
 	}
 }

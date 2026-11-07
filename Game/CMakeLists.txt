@@ -8,9 +8,11 @@
 find_package(Threads REQUIRED)
 
 add_executable(main
+    src/ArenaMap.cpp
     src/ArenaRules.cpp
     src/BulletField.cpp
     src/Game.cpp
+    src/GameAssets.cpp
     src/GameRules.cpp
     src/NetworkClient.cpp
     src/NetworkState.cpp
@@ -18,6 +20,7 @@ add_executable(main
     src/PeerEventBridge.cpp
     src/ReplayController.cpp
     src/ShipController.cpp
+    src/VisualRules.cpp
     src/main.cpp
 )
 
@@ -25,6 +28,15 @@ add_executable(main
 # EngineNetwork brings in cppzmq/libzmq (Milestone 2 Section 2: the SDL client is now
 # a real persistent network client, not optional).
 target_link_libraries(main PRIVATE Engine EngineNetwork Threads::Threads)
+
+# The game loads its PNGs from an `assets` folder next to the executable (see main.cpp), so copy
+# them there after every build. (generate_assets.py in the same folder is a development tool and
+# is not copied.)
+file(GLOB GAME_ASSET_FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/*.png")
+add_custom_command(TARGET main POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:main>/assets"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GAME_ASSET_FILES} "$<TARGET_FILE_DIR:main>/assets"
+)
 
 # The headless multiplayer server (Milestone 2 Section 2, dedicated-session topology
 # added in Section 4 checkpoint 2, server-authoritative moving platform added in
@@ -49,15 +61,17 @@ add_executable(ServerPlatformTest
 )
 target_link_libraries(ServerPlatformTest PRIVATE EngineNetwork)
 
-# Astro rebuild Checkpoint B: the pure gameplay core, all EngineCore-only (no SDL, no sockets, no
-# running server):
-#  - ArenaRulesTest: heading, circle overlap, wrap-around, spawn table, spawn selection.
+# The pure gameplay core, all EngineCore-only (no SDL, no sockets, no running server):
+#  - ArenaRulesTest: heading, circle overlap, circle-vs-rectangle, the map and its spawn points,
+#    spawn selection, and the pure drawing decisions (ship colour, sprite rotation, explosion frame).
 #  - BulletFieldTest: bullets (creation, movement, lifetime, leaving the arena, hit queries).
 #  - ShipControllerTest: the ship's event-driven gameplay through the real Engine::EventManager
 #    (rotation, forward movement, firing, Collision -> Death -> delayed Spawn, invulnerability).
 add_executable(ArenaRulesTest
+    src/ArenaMap.cpp
     src/ArenaRules.cpp
     src/GameRules.cpp
+    src/VisualRules.cpp
     src/ArenaRulesTest.cpp
 )
 target_link_libraries(ArenaRulesTest PRIVATE EngineCore)
@@ -90,7 +104,7 @@ add_executable(PeerEventBridgeTest
 )
 target_link_libraries(PeerEventBridgeTest PRIVATE EngineCore EngineNetworkCore)
 
-# Astro rebuild Checkpoint D: replay (control events, state samples, playback, live-state
+# Replay (control events, state samples, playback, live-state
 # restore, suppression of live input / bullets / network announcements during playback). Real
 # EventManager/ReplayRecorder/ShipController/BulletField/PeerEventBridge/GameObjects on a fake
 # clock; no SDL, no sockets.

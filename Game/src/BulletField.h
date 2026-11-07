@@ -6,16 +6,18 @@
 
 #include <vector>
 
-// Astro rebuild Checkpoint B: the bullets in flight. Spare Parts-specific, SDL-free.
+// The bullets in flight. Spare Parts-specific, SDL-free.
 //
-// A bullet is an ordinary Engine::GameObject (generic type, velocity, a render colour) living
+// A bullet is an ordinary Engine::GameObject (generic type, velocity) living
 // in the caller's registry, plus a tiny record kept here: who fired it and how old it is. No
 // Engine::ObjectType::Bullet exists, and the Engine knows nothing about bullets.
 //
-// Bullets do not wrap: one expires when its lifetime runs out OR once it is entirely outside
-// the arena. Lifetime is measured by summing the (Timeline-scaled) `deltaTime` of each
-// Update(), so pausing or slowing the Timeline pauses or slows a bullet's life exactly as it
-// slows its flight, and a zero-length frame changes nothing.
+// A bullet is spent (removed, silently — it raises no event) when its lifetime runs out, when it
+// touches a wall or obstacle (any registry object of type Boundary: the map is the same on every
+// client, so a bullet rebuilt from a peer's Shoot is stopped by exactly the same geometry), or if
+// it is somehow entirely outside the screen. It does not wrap or bounce. Lifetime is measured by summing the (Timeline-scaled)
+// `deltaTime` of each Update(), so pausing or slowing the Timeline pauses or slows a bullet's life
+// exactly as it slows its flight, and a zero-length frame changes nothing.
 //
 // OWNERSHIP (decided in the networked-combat checkpoint). A bullet's owner is the ObjectId of the
 // ship object that fired it IN THIS CLIENT's registry, not a PlayerId:
@@ -69,6 +71,8 @@ public:
 	float Radius() const;
 
 private:
+	bool TouchesSolid(const Engine::GameObject& bullet) const;
+
 	Engine::GameObjectRegistry& m_Objects;
 	const Engine::PhysicsSystem& m_Physics;
 	BulletConfig m_Config;

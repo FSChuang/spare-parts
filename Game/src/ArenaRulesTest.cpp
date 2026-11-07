@@ -1,13 +1,18 @@
-// Tests for the pure arena maths (ArenaRules.h) and spawn table (GameRules.h): heading,
-// circle overlap, ship wrap-around, bullet-out-of-arena, centre/top-left conversion, spawn
-// selection. No SDL, no sockets, no EventManager. Expected values are written out by hand
+// Tests for the pure arena maths (ArenaRules.h), the map (ArenaMap.h), the spawn table
+// (GameRules.h) and the drawing decisions (VisualRules.h): heading, circle overlap, circle-vs-
+// rectangle, the walls/obstacles/spawn points, bullet-out-of-arena, centre/top-left conversion,
+// spawn selection, ship colours, sprite rotation, explosion frames. No SDL, no sockets, no
+// EventManager. Expected values are written out by hand
 // (not recomputed with the production formulas), so these fail if the rules change.
 
+#include "ArenaMap.h"
 #include "ArenaRules.h"
 #include "GameRules.h"
+#include "VisualRules.h"
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace
 {
@@ -32,7 +37,6 @@ namespace
 	}
 
 	constexpr float Pi = 3.14159265358979323846f;
-	constexpr float R = 24.0f; // a ship radius used throughout
 }
 
 int main()
@@ -58,9 +62,12 @@ int main()
 		Check(allInRange, "Normalize_ManyInputs_AlwaysInHalfOpenRange");
 	}
 
-	Check(Near(HeadingTowardArenaCentre({ 480.0f, 540.0f }), 0.0f), "TowardCentre_FromLeftOfCentre_PointsRight");
-	Check(Near(HeadingTowardArenaCentre({ 960.0f, 100.0f }), Pi / 2.0f), "TowardCentre_FromAboveCentre_PointsDown");
-	Check(Near(HeadingTowardArenaCentre({ 960.0f, 900.0f }), -Pi / 2.0f), "TowardCentre_FromBelowCentre_PointsUp");
+	Check(Near(SpawnHeadingFor({ 220.0f, 220.0f }), 0.0f) && Near(SpawnHeadingFor({ 220.0f, 860.0f }), 0.0f),
+	      "SpawnHeading_LeftHalf_FacesRight");
+	Check(Near(SpawnHeadingFor({ 1700.0f, 220.0f }), Pi) && Near(SpawnHeadingFor({ 1700.0f, 860.0f }), Pi),
+	      "SpawnHeading_RightHalf_FacesLeft");
+	Check(Near(SpawnHeadingFor({ 959.0f, 100.0f }), 0.0f) && Near(SpawnHeadingFor({ 960.0f, 100.0f }), Pi),
+	      "SpawnHeading_SplitsExactlyAtTheCentreLine");
 
 	// --- circle overlap (strict) ---
 	Check(!CirclesOverlap({ 0.0f, 0.0f }, 5.0f, { 20.0f, 0.0f }, 5.0f), "Circles_Separated_DoNotOverlap");
@@ -76,29 +83,123 @@ int main()
 	          CirclesOverlap({ 0.0f, 0.0f }, 3.0f, { 3.0f, 4.0f }, 2.1f),
 	      "Circles_Diagonal_UsesTrueDistance");
 
-	// --- ship wrap-around (by bounding circle) ---
+	// --- circle vs rectangle (rect: top-left (100,100), size 200x50 -> x 100..300, y 100..150) ---
 	{
-		Engine::Vector2 inside = WrapShipCentre({ 500.0f, 400.0f }, R);
-		Check(inside.X == 500.0f && inside.Y == 400.0f, "Wrap_InsideArena_NoChange");
-		Engine::Vector2 touchingLeft = WrapShipCentre({ -R, 400.0f }, R);
-		Check(touchingLeft.X == -R, "Wrap_ExactlyTouchingLeftEdge_NotWrappedYet");
-		Engine::Vector2 touchingBottom = WrapShipCentre({ 500.0f, Astro::ArenaHeight + R }, R);
-		Check(touchingBottom.Y == Astro::ArenaHeight + R, "Wrap_ExactlyTouchingBottomEdge_NotWrappedYet");
+		const Engine::Vector2 rectPos{ 100.0f, 100.0f };
+		const Engine::Vector2 rectSize{ 200.0f, 50.0f };
+		Check(!CircleVsRect({ 50.0f, 125.0f }, 20.0f, rectPos, rectSize), "CircleRect_Outside_NoOverlap");
+		Check(!CircleVsRect({ 80.0f, 125.0f }, 20.0f, rectPos, rectSize), "CircleRect_TangentToTheLeftSide_NoOverlap");
+		Check(CircleVsRect({ 81.0f, 125.0f }, 20.0f, rectPos, rectSize), "CircleRect_OverlappingTheLeftSide_Overlap");
+		Check(!CircleVsRect({ 200.0f, 170.0f }, 20.0f, rectPos, rectSize), "CircleRect_TangentToTheBottomSide_NoOverlap");
+		Check(CircleVsRect({ 200.0f, 169.0f }, 20.0f, rectPos, rectSize), "CircleRect_OverlappingTheBottomSide_Overlap");
+		Check(CircleVsRect({ 290.0f, 125.0f }, 5.0f, rectPos, rectSize), "CircleRect_CentreInsideTheRect_Overlap");
+		// Corner: the nearest point is the corner (300,150); a circle at (310,160) with r=15 is 14.14 away.
+		Check(CircleVsRect({ 310.0f, 160.0f }, 15.0f, rectPos, rectSize), "CircleRect_OverlappingACorner_Overlap");
+		Check(!CircleVsRect({ 310.0f, 160.0f }, 14.0f, rectPos, rectSize), "CircleRect_JustMissingACorner_NoOverlap");
+		// The classic AABB-vs-circle mistake: the circle's bounding box touches the rect, the circle does not.
+		Check(!CircleVsRect({ 320.0f, 170.0f }, 25.0f, rectPos, rectSize), "CircleRect_BoundingBoxOverlapsButCircleDoesNot");
+		Check(CircleVsRect({ 200.0f, 125.0f }, 1.0f, rectPos, rectSize), "CircleRect_TinyBulletInside_Overlap");
+		Check(!CircleVsRect({ 200.0f, 400.0f }, 5.0f, rectPos, rectSize), "CircleRect_FarAway_NoOverlap");
+	}
 
-		// Left -> right: just past -R reappears just past the right edge (width + 2R further on).
-		Engine::Vector2 left = WrapShipCentre({ -25.0f, 400.0f }, R);
-		Check(Near(left.X, 1943.0f) && left.Y == 400.0f, "Wrap_LeftToRight");
-		Engine::Vector2 right = WrapShipCentre({ 1945.0f, 400.0f }, R);
-		Check(Near(right.X, -23.0f) && right.Y == 400.0f, "Wrap_RightToLeft");
-		Engine::Vector2 top = WrapShipCentre({ 500.0f, -25.0f }, R);
-		Check(top.X == 500.0f && Near(top.Y, 1103.0f), "Wrap_TopToBottom");
-		Engine::Vector2 bottom = WrapShipCentre({ 500.0f, 1105.0f }, R);
-		Check(bottom.X == 500.0f && Near(bottom.Y, -23.0f), "Wrap_BottomToTop");
-		Engine::Vector2 corner = WrapShipCentre({ -30.0f, -30.0f }, R);
-		Check(Near(corner.X, 1938.0f) && Near(corner.Y, 1098.0f), "Wrap_BothAxesAtACorner");
+	// --- the map ---
+	{
+		const std::vector<SolidRect>& walls = ArenaWalls();
+		const std::vector<SolidRect>& obstacles = ArenaObstacles();
+		Check(walls.size() == 4, "Map_HasFourOuterWalls");
+		Check(obstacles.size() == 5, "Map_HasACentralBlockAndFourBarriers");
 
-		// The reappeared ship is outside the opposite edge (still fully invisible), so it slides in.
-		Check(left.X > Astro::ArenaWidth + R - 2.0f * R, "Wrap_ReappearsBeyondTheOppositeEdge");
+		// Walls: the four sides of a frame 70 px in from the screen edge, 32 px thick.
+		const SolidRect& top = walls[0];
+		const SolidRect& bottom = walls[1];
+		const SolidRect& left = walls[2];
+		const SolidRect& right = walls[3];
+		Check(top.Position.X == 70.0f && top.Position.Y == 70.0f && top.Size.X == 1780.0f && top.Size.Y == 32.0f, "Map_TopWall");
+		Check(bottom.Position.X == 70.0f && bottom.Position.Y == 978.0f && bottom.Size.X == 1780.0f && bottom.Size.Y == 32.0f, "Map_BottomWall");
+		Check(left.Position.X == 70.0f && left.Position.Y == 70.0f && left.Size.X == 32.0f && left.Size.Y == 940.0f, "Map_LeftWall");
+		Check(right.Position.X == 1818.0f && right.Position.Y == 70.0f && right.Size.X == 32.0f && right.Size.Y == 940.0f, "Map_RightWall");
+
+		SolidRect playfield = ArenaPlayfield();
+		Check(playfield.Position.X == 102.0f && playfield.Position.Y == 102.0f && playfield.Size.X == 1716.0f && playfield.Size.Y == 876.0f,
+		      "Map_PlayfieldIsTheOpenAreaInsideTheWalls");
+
+		// Every obstacle lies fully inside the playfield, clear of the walls.
+		bool inside = true;
+		for (const SolidRect& o : obstacles)
+		{
+			inside = inside && o.Position.X >= playfield.Position.X + 100.0f && o.Position.Y >= playfield.Position.Y + 100.0f &&
+			         o.Position.X + o.Size.X <= playfield.Position.X + playfield.Size.X - 100.0f &&
+			         o.Position.Y + o.Size.Y <= playfield.Position.Y + playfield.Size.Y - 100.0f;
+		}
+		Check(inside, "Map_ObstaclesLieInsideThePlayfieldWithRoomToFlyAround");
+
+		// The map is symmetric about both centre lines: every solid has a mirror image.
+		auto hasMirror = [&](const SolidRect& r, bool flipX, bool flipY)
+		{
+			Engine::Vector2 mirroredPosition{ flipX ? Astro::ArenaWidth - (r.Position.X + r.Size.X) : r.Position.X,
+				                             flipY ? Astro::ArenaHeight - (r.Position.Y + r.Size.Y) : r.Position.Y };
+			for (const SolidRect& other : obstacles)
+			{
+				if (Near(other.Position.X, mirroredPosition.X) && Near(other.Position.Y, mirroredPosition.Y) &&
+				    Near(other.Size.X, r.Size.X) && Near(other.Size.Y, r.Size.Y))
+				{
+					return true;
+				}
+			}
+			return false;
+		};
+		bool symmetric = true;
+		for (const SolidRect& o : obstacles)
+		{
+			symmetric = symmetric && hasMirror(o, true, false) && hasMirror(o, false, true) && hasMirror(o, true, true);
+		}
+		Check(symmetric, "Map_ObstaclesAreSymmetricAboutBothCentreLines");
+		Check(CircleVsRect({ Astro::ArenaWidth / 2.0f, Astro::ArenaHeight / 2.0f }, 1.0f, obstacles[0].Position, obstacles[0].Size),
+		      "Map_TheReactorSitsAtTheArenaCentre");
+
+		// Spawn points: inside the playfield and clear of every wall and obstacle, with a ship's
+		// full radius and a margin to spare.
+		const float clearance = Astro::ShipRadius + 40.0f;
+		bool spawnsSafe = true;
+		bool spawnsInside = true;
+		for (std::size_t i = 0; i < ArenaSpawnCount; ++i)
+		{
+			Engine::Vector2 spawn = ArenaSpawnCentre(i);
+			spawnsInside = spawnsInside && spawn.X - Astro::ShipRadius > playfield.Position.X &&
+			               spawn.X + Astro::ShipRadius < playfield.Position.X + playfield.Size.X &&
+			               spawn.Y - Astro::ShipRadius > playfield.Position.Y &&
+			               spawn.Y + Astro::ShipRadius < playfield.Position.Y + playfield.Size.Y;
+			for (const std::vector<SolidRect>* group : { &walls, &obstacles })
+			{
+				for (const SolidRect& solid : *group)
+				{
+					spawnsSafe = spawnsSafe && !CircleVsRect(spawn, clearance, solid.Position, solid.Size);
+				}
+			}
+		}
+		Check(spawnsInside, "Map_SpawnPointsAreInsideThePlayfield");
+		Check(spawnsSafe, "Map_SpawnPointsClearOfEveryWallAndObstacle_WithAMargin");
+
+		// And a ship leaving a spawn straight ahead (the way it faces) is not about to hit anything
+		// within the first second of protection: the lane along its row is clear for 320 px.
+		bool laneClear = true;
+		for (std::size_t i = 0; i < ArenaSpawnCount; ++i)
+		{
+			Engine::Vector2 spawn = ArenaSpawnCentre(i);
+			float heading = SpawnHeadingFor(spawn);
+			for (float travelled = 0.0f; travelled <= Astro::ShipSpeed; travelled += 8.0f)
+			{
+				Engine::Vector2 at{ spawn.X + std::cos(heading) * travelled, spawn.Y + std::sin(heading) * travelled };
+				for (const std::vector<SolidRect>* group : { &walls, &obstacles })
+				{
+					for (const SolidRect& solid : *group)
+					{
+						laneClear = laneClear && !CircleVsRect(at, Astro::ShipRadius, solid.Position, solid.Size);
+					}
+				}
+			}
+		}
+		Check(laneClear, "Map_ShipsCanFlyOffFromEverySpawnForAFullSecondWithoutTouchingAnything");
 	}
 
 	// --- bullets leaving the arena ---
@@ -140,6 +241,32 @@ int main()
 		          ArenaSpawnCentre(3).X > Astro::ArenaWidth / 2.0f && ArenaSpawnCentre(3).Y > Astro::ArenaHeight / 2.0f,
 		      "SpawnTable_CornersAreWhereTheyShouldBe");
 		Check(ArenaSpawnCentre(ArenaSpawnCount + 1).X == ArenaSpawnCentre(1).X, "SpawnTable_IndexIsReducedModuloCount");
+	}
+
+	// --- drawing decisions ---
+	Check(ShipVariantFor(1) == 0 && ShipVariantFor(2) == 1 && ShipVariantFor(3) == 2 && ShipVariantFor(4) == 3,
+	      "Visual_PlayerIds1To4_GetFourDifferentShips");
+	Check(ShipVariantFor(5) == 0 && ShipVariantFor(8) == 3, "Visual_ShipVariantsRepeatBeyondFourPlayers");
+	Check(ShipVariantFor(0) == 0, "Visual_UnassignedPlayerIdUsesTheFirstShip");
+	Check(ShipVariantFor(1) != ShipVariantFor(2), "Visual_TwoPlayersInAGameLookDifferent");
+	Check(Near(ShipSpriteRotation(0.0f), Pi / 2.0f), "Visual_HeadingZeroDrawsTheUpwardArtworkTurnedToFaceRight");
+	Check(Near(ShipSpriteRotation(-Pi / 2.0f), 0.0f), "Visual_HeadingUp_DrawsTheArtworkUnrotated");
+	Check(Near(ShipSpriteRotation(Pi / 2.0f) - ShipSpriteRotation(0.0f), Pi / 2.0f), "Visual_OffsetIsConstantAcrossHeadings");
+	Check(ExplosionFrameAt(-0.1) == -1, "Explosion_BeforeItStarts_NoFrame");
+	Check(ExplosionFrameAt(0.0) == 0, "Explosion_AtTheStart_FirstFrame");
+	Check(ExplosionFrameAt(0.05) == 0 && ExplosionFrameAt(0.1) == 1, "Explosion_FramesAdvanceEveryTenthOfASecond");
+	Check(ExplosionFrameAt(0.55) == 5, "Explosion_JustBeforeTheEnd_LastFrame");
+	Check(ExplosionFrameAt(Astro::ExplosionDuration) == -1 && ExplosionFrameAt(10.0) == -1, "Explosion_AfterTheDuration_Expired");
+	{
+		bool monotonic = true;
+		int previous = 0;
+		for (double t = 0.0; t < Astro::ExplosionDuration; t += 0.01)
+		{
+			int frame = ExplosionFrameAt(t);
+			monotonic = monotonic && frame >= previous && frame < Astro::ExplosionFrameCount;
+			previous = frame;
+		}
+		Check(monotonic, "Explosion_FramesNeverGoBackwardsAndStayInRange");
 	}
 
 	std::printf("\n%s\n", g_Failures == 0 ? "All tests passed." : "Some tests FAILED.");

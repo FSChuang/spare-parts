@@ -37,7 +37,7 @@
 // captured; each update shows the recorded frame for the elapsed playback time; when the recorded
 // span has elapsed the captured state is put back and live play resumes exactly where it was.
 // While playing:
-//   - the ship controller is in playback mode: live input, steering, firing, wrapping and bullet
+//   - the ship controller is in playback mode: live input, steering, firing, wall and bullet
 //     hit detection do nothing, and replayed events are observed but never acted on;
 //   - Game skips physics and does not touch the live BulletField at all: its bullets neither move,
 //     age, expire nor collide, and resume from the very same state afterwards;

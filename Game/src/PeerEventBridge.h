@@ -7,7 +7,7 @@
 #include "BulletField.h"
 
 #include <functional>
-#include <unordered_map>
+#include <unordered_set>
 
 // The explicit seam between the network and the local game for discrete gameplay notifications
 // (Spare Parts-specific, SDL-free and socket-free, so it is unit tested without a Game or a real
@@ -44,24 +44,21 @@
 //
 // REMOTE LIFE STATE, kept by PlayerId. A remote player is ALIVE until its Death arrives, and
 // stays DEAD until its Spawn arrives — never because a timer ran out. (Newly discovered players
-// have no entry, so they are alive.) A visible death marker shows for MarkDuration after the
-// death, measured from the event's own receiver-local timestamp; after that the ship is simply
-// hidden. Delivery is not guaranteed (see PeerClient.h): a lost Spawn leaves that player hidden
+// have no entry, so they are alive.) Game hides a dead remote ship and plays an explosion at the
+// spot where it died (it learns of the death from the same Death event this bridge raises).
+// Delivery is not guaranteed (see PeerClient.h): a lost Spawn leaves that player hidden
 // until its next Death or Spawn arrives — an accepted limit of the peer-authoritative slice.
 class PeerEventBridge
 {
 public:
-	/// How long, in logical seconds, a remote player's death marker shows after its Death.
-	static constexpr double MarkDuration = 1.0;
-
 	using NetworkSink = std::function<void(const Engine::NetworkEvent&)>;
 
 	/// `events`, `objects` and `bullets` must outlive the bridge. `localShipObjectId` is the local
 	/// ship's object, whose network id (set once connected) identifies it on the wire.
 	/// `sendToPeers` is called synchronously, once per announcement; the frame's source id is
-	/// re-stamped by the transport. `timeSource` must be the same logical clock the EventManager uses.
+	/// re-stamped by the transport.
 	PeerEventBridge(Engine::EventManager& events, Engine::GameObjectRegistry& objects, BulletField& bullets,
-	                Engine::ObjectId localShipObjectId, std::function<double()> timeSource, NetworkSink sendToPeers);
+	                Engine::ObjectId localShipObjectId, NetworkSink sendToPeers);
 
 	// The subscriptions capture `this`; never copy or move.
 	PeerEventBridge(const PeerEventBridge&) = delete;
@@ -87,9 +84,6 @@ public:
 	/// False from a remote player's Death until its Spawn; true for everyone else.
 	bool IsRemoteAlive(Engine::ObjectId remoteObjectId) const;
 
-	/// True while the remote player's death marker should be drawn (dead, within MarkDuration).
-	bool IsDeathMarkerActive(Engine::ObjectId remoteObjectId) const;
-
 	/// Forgets life state of players whose object no longer exists (disconnected). Call once per
 	/// frame; the queries above are correct without it.
 	void PruneRemoved();
@@ -107,11 +101,10 @@ private:
 	Engine::GameObjectRegistry& m_Objects;
 	BulletField& m_Bullets;
 	Engine::ObjectId m_LocalShipObjectId;
-	std::function<double()> m_TimeSource;
 	NetworkSink m_SendToPeers;
 
-	// PlayerId -> logical time of its (latest) Death. Present means dead.
-	std::unordered_map<Engine::PlayerId, double> m_DeadSince;
+	// PlayerIds of remote players currently dead (from their Death until their Spawn).
+	std::unordered_set<Engine::PlayerId> m_Dead;
 
 	bool m_AnnounceEnabled = true;
 	bool m_DiscardRemoteShoots = false;

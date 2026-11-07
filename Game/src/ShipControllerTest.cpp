@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -30,6 +31,17 @@ namespace
 		{
 			std::printf("[FAIL] %s\n", name);
 			++g_Failures;
+		}
+	}
+
+	// A precondition the rest of a test indexes into: report and stop rather than read past the end.
+	void Require(bool condition, const char* name)
+	{
+		Check(condition, name);
+		if (!condition)
+		{
+			std::printf("Cannot continue: a precondition failed.\n");
+			std::exit(1);
 		}
 	}
 
@@ -57,6 +69,9 @@ namespace
 			ship.SetVelocity({ 0.0f, 0.0f });
 			ShipId = ship.GetId();
 			OtherShipId = Objects.Create(Engine::ObjectType::Player, { 900.0f, 900.0f }, ShipSize).GetId();
+			// A wall (x 1000..1032, y 300..800) and a mid-arena obstacle, both solid Boundary objects.
+			WallId = Objects.Create(Engine::ObjectType::Boundary, { 1000.0f, 300.0f }, { 32.0f, 500.0f }).GetId();
+			ObstacleId = Objects.Create(Engine::ObjectType::Boundary, { 1300.0f, 300.0f }, { 180.0f, 180.0f }).GetId();
 
 			Controller = std::make_unique<ShipController>(
 			    Events, Objects, Bullets, ShipId, TestConfig, [this] { return NextSpawn; }, [this] { return Now; });
@@ -109,11 +124,17 @@ namespace
 			return Bullets.Fire(Centre(), 0.0f, Engine::NoObjectId);
 		}
 
-		// Game's step 8: look for hits (raises Collision events only).
+		// Game's step 7: look for hits (raises Collision events only).
 		void DetectHits()
 		{
 			Controller->BeginFrame();
 			Controller->DetectBulletHits();
+		}
+
+		void DetectWallHits()
+		{
+			Controller->BeginFrame();
+			Controller->DetectSolidHits();
 		}
 
 		double Now = 0.0;
@@ -124,6 +145,8 @@ namespace
 		BulletField Bullets;
 		Engine::ObjectId ShipId = 0;
 		Engine::ObjectId OtherShipId = 0;
+		Engine::ObjectId WallId = 0;
+		Engine::ObjectId ObstacleId = 0;
 		std::vector<Engine::Event> Seen;
 		std::vector<Engine::ScopedSubscription> Subscriptions;
 		std::unique_ptr<ShipController> Controller;
@@ -251,16 +274,107 @@ int main()
 		Check(scene.Count(Engine::EventType::Input) == 4, "Input_LeftPlusFire_RaiseTwoEvents");
 	}
 
-	// ======== Wrap-around through the controller ========
+	// ======== Walls and obstacles ========
 	{
-		Scene scene;
+		Scene scene; // touching a wall raises a Collision; the chain then kills the ship
+		scene.SpawnVulnerableShip();
+		scene.Seen.clear();
+		SetCenter(scene.Ship(), { 990.0f, 540.0f }); // radius 24: overlapping the wall (x 1000..)
+		scene.DetectWallHits();
+		Check(scene.Controller->IsAlive() && scene.Events.PendingCount() == 1 && scene.Count(Engine::EventType::Death) == 0,
+		      "Wall_Touching_RaisesOnlyACollision_NothingDiesYet");
+		scene.Events.DispatchDue();
+		Require(scene.Count(Engine::EventType::Collision) == 1 && scene.Count(Engine::EventType::Death) == 1,
+		        "Wall_CollisionThenDeath");
+		Check(scene.Seen[0].Type == Engine::EventType::Collision && scene.Seen[1].Type == Engine::EventType::Death,
+		      "Wall_CollisionIsHandledBeforeDeath");
+		const auto& collision = std::get<Engine::CollisionEventData>(scene.Seen[0].Payload);
+		const auto& death = std::get<Engine::DeathEventData>(scene.Seen[1].Payload);
+		Check(collision.A == scene.ShipId && collision.B == scene.WallId, "Wall_CollisionNamesTheShipAndTheWall");
+		Check(death.Subject == scene.ShipId && death.Cause == scene.WallId, "Wall_DeathNamesTheShipAndTheWallAsCause");
+		Check(!scene.Controller->IsAlive() && scene.Ship().GetVelocity().X == 0.0f, "Wall_ShipIsDeadAndStopped");
+		Check(scene.Events.PendingCount() == 1, "Wall_ARespawnIsScheduled");
+		scene.Now += 2.0;
+		scene.Events.DispatchDue();
+		Check(scene.Controller->IsAlive(), "Wall_ShipRespawnsAfterTheDelay");
+	}
+	{
+		Scene scene; // an obstacle in the middle of the arena is just as deadly
+		scene.SpawnVulnerableShip();
+		SetCenter(scene.Ship(), { 1390.0f, 390.0f }); // inside the obstacle
+		scene.DetectWallHits();
+		scene.Events.DispatchDue();
+		Check(!scene.Controller->IsAlive(), "Wall_AnObstacleKillsToo");
+	}
+	{
+		Scene scene; // clear of every solid: nothing happens
+		scene.SpawnVulnerableShip();
+		SetCenter(scene.Ship(), { 900.0f, 540.0f }); // 76 px from the wall edge
+		scene.DetectWallHits();
+		Check(scene.Events.PendingCount() == 0 && scene.Controller->IsAlive(), "Wall_Clear_NoCollision");
+		SetCenter(scene.Ship(), { 976.0f, 540.0f }); // exactly tangent: 24 px from the wall at 1000
+		scene.DetectWallHits();
+		Check(scene.Events.PendingCount() == 0, "Wall_ExactlyTangent_NoCollision");
+	}
+	{
+		Scene scene; // an invulnerable ship passes through: no event, no death; protection ending while inside kills
 		scene.SpawnShip();
-		SetCenter(scene.Ship(), { -30.0f, 540.0f });
-		scene.Controller->WrapAroundArena();
-		Check(Near(scene.Centre().X, 1938.0f) && Near(scene.Centre().Y, 540.0f), "Wrap_ShipThatLeftTheLeftEdge_AppearsOnTheRight");
-		SetCenter(scene.Ship(), { 960.0f, 540.0f });
-		scene.Controller->WrapAroundArena();
-		Check(Near(scene.Centre().X, 960.0f), "Wrap_ShipInsideTheArena_NotMoved");
+		SetCenter(scene.Ship(), { 1010.0f, 540.0f }); // inside the wall
+		scene.DetectWallHits();
+		scene.Events.DispatchDue();
+		Check(scene.Controller->IsAlive() && scene.Events.PendingCount() == 0 && scene.Count(Engine::EventType::Death) == 0 &&
+		          scene.Count(Engine::EventType::Collision) == 0,
+		      "Wall_InvulnerableShip_SurvivesAndRaisesNothing");
+		scene.Now += 1.0; // protection over, still inside
+		scene.DetectWallHits();
+		scene.Events.DispatchDue();
+		Check(!scene.Controller->IsAlive(), "Wall_WhenProtectionEnds_TheShipInsideTheWallDies");
+	}
+	{
+		Scene scene; // the handler itself also refuses to kill a protected ship (defence in depth)
+		scene.SpawnShip();
+		scene.Events.Raise(Engine::CollisionEventData{ scene.ShipId, scene.WallId });
+		scene.Events.DispatchDue();
+		Check(scene.Controller->IsAlive() && scene.Count(Engine::EventType::Death) == 0, "Wall_ACollisionEventOnAProtectedShip_IsNotLethal");
+	}
+	{
+		Scene scene; // touching two solids in one frame: one death, one respawn
+		scene.SpawnVulnerableShip();
+		scene.Objects.Create(Engine::ObjectType::Boundary, { 980.0f, 520.0f }, { 60.0f, 60.0f });
+		SetCenter(scene.Ship(), { 1010.0f, 540.0f });
+		scene.Seen.clear();
+		scene.DetectWallHits();
+		Check(scene.Events.PendingCount() == 2, "Wall_TwoSolidsTouched_TwoCollisions");
+		scene.Events.DispatchDue();
+		Check(scene.Count(Engine::EventType::Death) == 1 && scene.Events.PendingCount() == 1, "Wall_TwoSolids_ExactlyOneDeathAndOneSpawn");
+	}
+	{
+		Scene scene; // a wall and a bullet in the same frame: still one death
+		scene.SpawnVulnerableShip();
+		SetCenter(scene.Ship(), { 990.0f, 540.0f });
+		scene.DropHostileBulletOnShip();
+		scene.Seen.clear();
+		scene.Controller->BeginFrame();
+		scene.Controller->DetectSolidHits();
+		scene.Controller->DetectBulletHits();
+		scene.Events.DispatchDue();
+		Check(scene.Count(Engine::EventType::Death) == 1, "Wall_PlusABullet_ExactlyOneDeath");
+	}
+	{
+		Scene scene; // a dead ship in a wall cannot die again, and does not collide
+		scene.SpawnVulnerableShip();
+		scene.Events.Raise(Engine::DeathEventData{ scene.ShipId, Engine::NoObjectId });
+		scene.Events.DispatchDue();
+		SetCenter(scene.Ship(), { 1010.0f, 540.0f });
+		scene.DetectWallHits();
+		Check(scene.Events.PendingCount() == 1, "Wall_DeadShipInAWall_OnlyTheScheduledSpawnPending");
+	}
+	{
+		Scene scene; // a Collision naming a non-solid, non-bullet object is harmless (the old "other ship" case)
+		scene.SpawnVulnerableShip();
+		scene.Events.Raise(Engine::CollisionEventData{ scene.ShipId, scene.OtherShipId });
+		scene.Events.DispatchDue();
+		Check(scene.Controller->IsAlive(), "Wall_ACollisionWithAnOrdinaryObject_DoesNothing");
 	}
 
 	// ======== Firing ========
@@ -381,7 +495,7 @@ int main()
 		Check(!scene.Controller->IsAlive(), "Revive_DeathAlone_KillsTheShip");
 		scene.Controller->ApplySteering(0.1f);
 		scene.Input(true, true, true);
-		scene.Controller->WrapAroundArena();
+		scene.Controller->DetectSolidHits();
 		scene.Controller->DetectBulletHits();
 		scene.Events.DispatchDue();
 		Check(!scene.Controller->IsAlive(), "Revive_NothingButSpawnBringsAShipBack");
