@@ -60,7 +60,7 @@ void LocalPlayerController::RaiseInputEvents(bool leftHeld, bool rightHeld, bool
 
 	if (jumpPressed)
 	{
-		m_Events.Raise(Engine::InputEventData{ Engine::InputAction::Jump, true }, InputEventPriority);
+		m_Events.Raise(Engine::InputEventData{ Engine::InputAction::ActionPrimary, true }, InputEventPriority);
 	}
 }
 
@@ -216,7 +216,7 @@ void LocalPlayerController::OnInput(const Engine::InputEventData& input)
 		m_MoveRightActive = input.Pressed;
 		break;
 
-	case Engine::InputAction::Jump:
+	case Engine::InputAction::ActionPrimary:
 		// Grounded-only, and consuming the grounded state: one jump per ground contact, so
 		// two Jump events in one frame (e.g. Space and W together) still jump once.
 		if (input.Pressed && m_IsGrounded)

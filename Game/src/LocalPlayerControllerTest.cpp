@@ -156,7 +156,7 @@ int main()
 		Scene scene;
 		scene.Player().SetVelocity({ 0.0f, 0.0f });
 		scene.Frame(false, false, true);
-		Check(scene.SeenInput.size() == 1 && InputOf(scene.SeenInput[0]).Action == Engine::InputAction::Jump,
+		Check(scene.SeenInput.size() == 1 && InputOf(scene.SeenInput[0]).Action == Engine::InputAction::ActionPrimary,
 		      "Jump_Press_RaisesOneJumpEvent");
 		Check(scene.Player().GetVelocity().Y == 0.0f, "Jump_WhileNotGrounded_HasNoEffect");
 
