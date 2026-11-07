@@ -10,7 +10,10 @@ namespace
 	// This game's window configuration (ENGINEERING_SPEC.md §9: tunables stay at the top level).
 	constexpr int WindowWidth = 1920;
 	constexpr int WindowHeight = 1080;
-	const char* const WindowTitle = "Spare Parts";
+	const char* const WindowTitle = "Astro Arena";
+
+	// A dark, space-like background (the engine's default clear color is blue).
+	constexpr Engine::Color SpaceClearColor{ 8, 10, 28, 255 };
 
 	// Milestone 2 Section 2: all local demo clients connect here by default; override
 	// with a command-line argument, e.g. `./main tcp://127.0.0.1:5556`.
@@ -23,6 +26,7 @@ int main(int argc, char* argv[])
 
 	Engine::WindowConfig windowConfig{ WindowTitle, WindowWidth, WindowHeight };
 	Engine::Application application(windowConfig);
+	application.GetRenderer().SetClearColor(SpaceClearColor);
 
 	// Every gameplay event is stamped with the game Timeline's logical time, so pausing or
 	// scaling the Timeline (P, 1/2/3) affects event timing exactly as it affects physics.

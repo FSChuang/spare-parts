@@ -14,7 +14,7 @@
 // owned by Game and used only on the main thread, is the only place they meet.
 //
 // LOCAL -> NETWORK. When a Death event for the LOCAL player is dispatched (the same event
-// LocalPlayerController turns into a respawn), this bridge also hands a Death notification
+// ShipController turns into a scheduled respawn), this bridge also hands a Death notification
 // to `sendToPeers` (Game wires it to PeerClient::PublishEvent). A Death event about any
 // other object is never re-broadcast, so a received notification can never echo back out.
 //
@@ -25,11 +25,11 @@
 // A PlayerId with no matching remote object (unknown, or already disconnected) is ignored.
 //
 // WHY A REMOTE DEATH CAN NEVER RESPAWN THE LOCAL PLAYER. The raised event is the same
-// EventType::Death, but its Subject is the remote player's object, and LocalPlayerController
-// handles a Death only when the Subject is the local player (it returns immediately
+// EventType::Death, but its Subject is the remote player's object, and ShipController
+// handles a Death only when the Subject is the local ship (it returns immediately
 // otherwise). Local and remote deaths are therefore separated by WHO the event is about —
 // no new engine event type, no flag — and each is handled by its own subscriber: the
-// controller for the local player, this bridge for remote players.
+// controller for the local ship, this bridge for remote players.
 //
 // REMOTE REACTION. This bridge's Death handler, for a remote subject, marks that player
 // "recently died" for MarkDuration of logical time, measured from the event's own
@@ -60,8 +60,8 @@ public:
 	/// Returns false, raising nothing, if no remote object has that network PlayerId.
 	bool HandleNetworkEvent(const Engine::NetworkEvent& networkEvent);
 
-	/// While disabled, a local Death is NOT announced to peers. Game turns this off during
-	/// replay playback so a replayed death is never broadcast as a new one. Remote
+	/// While disabled, a local Death is NOT announced to peers. For replay playback (not
+	/// wired in Game at present), so a replayed death is never broadcast as a new one. Remote
 	/// notifications and markers are unaffected (peers are live during a local replay).
 	void SetAnnounceEnabled(bool enabled);
 

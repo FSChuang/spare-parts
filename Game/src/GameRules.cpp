@@ -1,26 +1,34 @@
 #include "GameRules.h"
 
+#include "ArenaRules.h"
+
+namespace
+{
+	// Distance from the arena edge to a spawn centre.
+	constexpr float SpawnInset = 160.0f;
+}
+
 std::size_t SelectSpawnIndex(std::uint32_t playerId, std::size_t spawnCount)
 {
 	return static_cast<std::size_t>(playerId) % spawnCount;
 }
 
-float NextCameraOffsetX(float currentOffsetX, float playerVelocityX, float viewWidth)
+Engine::Vector2 ArenaSpawnCentre(std::size_t index)
 {
-	if (playerVelocityX > 0.0f)
+	const float left = SpawnInset;
+	const float right = Astro::ArenaWidth - SpawnInset;
+	const float top = SpawnInset;
+	const float bottom = Astro::ArenaHeight - SpawnInset;
+
+	switch (index % ArenaSpawnCount)
 	{
-		return viewWidth;
+	case 0:
+		return { left, top };
+	case 1:
+		return { right, top };
+	case 2:
+		return { left, bottom };
+	default:
+		return { right, bottom };
 	}
-
-	if (playerVelocityX < 0.0f)
-	{
-		return 0.0f;
-	}
-
-	return currentOffsetX;
-}
-
-float CameraOffsetForWorldX(float worldX, float viewWidth)
-{
-	return worldX >= viewWidth ? viewWidth : 0.0f;
 }

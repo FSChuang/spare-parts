@@ -43,7 +43,7 @@ void PeerEventBridge::OnDeath(const Engine::Event& event)
 
 	if (death.Subject == m_LocalPlayerObjectId)
 	{
-		// The local player died (LocalPlayerController is handling the respawn): tell peers.
+		// The local player died (ShipController is handling the respawn): tell peers.
 		if (m_AnnounceEnabled)
 		{
 			m_SendToPeers(Engine::NetworkEventKind::Death);
@@ -52,7 +52,7 @@ void PeerEventBridge::OnDeath(const Engine::Event& event)
 	}
 
 	// A Death about a remote player's object: show it. Anything that is not a networked
-	// player object (the enemy, a stale id) is not ours to mark.
+	// player object (a bullet, a stale id) is not ours to mark.
 	const Engine::GameObject* subject = m_Objects.Find(death.Subject);
 	if (subject != nullptr && subject->HasNetworkId())
 	{

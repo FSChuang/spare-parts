@@ -8,14 +8,15 @@
 find_package(Threads REQUIRED)
 
 add_executable(main
+    src/ArenaRules.cpp
+    src/BulletField.cpp
     src/Game.cpp
     src/GameRules.cpp
-    src/LocalPlayerController.cpp
     src/NetworkClient.cpp
     src/NetworkState.cpp
     src/PeerClient.cpp
     src/PeerEventBridge.cpp
-    src/ReplayController.cpp
+    src/ShipController.cpp
     src/main.cpp
 )
 
@@ -47,56 +48,46 @@ add_executable(ServerPlatformTest
 )
 target_link_libraries(ServerPlatformTest PRIVATE EngineNetwork)
 
-# Deterministic unit test for GameRules.h (Milestone 3: spawn selection, camera-scroll
-# threshold decision) — pure logic, no SDL, no sockets, no running server.
-add_executable(GameRulesTest
+# Astro rebuild Checkpoint B: the pure gameplay core, all EngineCore-only (no SDL, no sockets, no
+# running server):
+#  - ArenaRulesTest: heading, circle overlap, wrap-around, spawn table, spawn selection.
+#  - BulletFieldTest: bullets (creation, movement, lifetime, leaving the arena, hit queries).
+#  - ShipControllerTest: the ship's event-driven gameplay through the real Engine::EventManager
+#    (rotation, forward movement, firing, Collision -> Death -> delayed Spawn, invulnerability).
+add_executable(ArenaRulesTest
+    src/ArenaRules.cpp
     src/GameRules.cpp
-    src/GameRulesTest.cpp
+    src/ArenaRulesTest.cpp
 )
+target_link_libraries(ArenaRulesTest PRIVATE EngineCore)
 
-# Bugfix checkpoint: death-zone GEOMETRY regression tests (including the tunneling case)
-# using the real Engine::GameObject + Engine::IsColliding mechanism. Links EngineCore
-# only — no SDL, no sockets, no running server.
-add_executable(DeathZoneGeometryTest
-    src/DeathZoneGeometryTest.cpp
+add_executable(BulletFieldTest
+    src/ArenaRules.cpp
+    src/BulletField.cpp
+    src/BulletFieldTest.cpp
 )
-target_link_libraries(DeathZoneGeometryTest PRIVATE EngineCore)
+target_link_libraries(BulletFieldTest PRIVATE EngineCore)
 
-# Milestone 4 Checkpoint 2: the local player's event-driven gameplay (Input/Collision/Death/
-# Spawn chain, death dedupe, spawn reset) exercised through the real LocalPlayerController,
-# a real Engine::EventManager (with a fake clock) and real GameObjects. EngineCore only — no
-# SDL, no sockets, no running server.
-add_executable(LocalPlayerControllerTest
-    src/LocalPlayerController.cpp
-    src/GameRules.cpp
-    src/LocalPlayerControllerTest.cpp
+add_executable(ShipControllerTest
+    src/ArenaRules.cpp
+    src/BulletField.cpp
+    src/ShipController.cpp
+    src/ShipControllerTest.cpp
 )
-target_link_libraries(LocalPlayerControllerTest PRIVATE EngineCore)
+target_link_libraries(ShipControllerTest PRIVATE EngineCore)
 
 # Milestone 4 Checkpoint 3: the network-event <-> local-event bridge (local death announce,
 # remote death notification -> local Death event + marker, expiry, unknown ids, local/remote
-# separation). Real EventManager/GameObjects/LocalPlayerController with a fake clock; no
-# sockets (the PeerClient transport is proven in PeerClientIntegrationTest). No SDL.
+# separation). Real EventManager/GameObjects/ShipController with a fake clock; no sockets (the
+# PeerClient transport is proven in PeerClientIntegrationTest). No SDL.
 add_executable(PeerEventBridgeTest
+    src/ArenaRules.cpp
+    src/BulletField.cpp
     src/PeerEventBridge.cpp
-    src/LocalPlayerController.cpp
-    src/GameRules.cpp
+    src/ShipController.cpp
     src/PeerEventBridgeTest.cpp
 )
 target_link_libraries(PeerEventBridgeTest PRIVATE EngineCore EngineNetworkCore)
-
-# Milestone 4 Checkpoint 4: Spare Parts replay (state samples, playback, live-state restore,
-# suppression of live input/hazards/network announcements during playback). Real
-# EventManager/ReplayRecorder/LocalPlayerController/PeerEventBridge/GameObjects on a fake
-# clock; no SDL, no sockets.
-add_executable(ReplayControllerTest
-    src/ReplayController.cpp
-    src/PeerEventBridge.cpp
-    src/LocalPlayerController.cpp
-    src/GameRules.cpp
-    src/ReplayControllerTest.cpp
-)
-target_link_libraries(ReplayControllerTest PRIVATE EngineCore EngineNetworkCore)
 
 # Real, non-SDL integration test for NetworkClient's Milestone 2 Section 3 threading
 # contract (see NetworkClientIntegrationTest.cpp for what it proves and why it isn't

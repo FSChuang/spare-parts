@@ -1,10 +1,12 @@
 // Focused tests for PeerEventBridge (Milestone 4 Checkpoint 3): the seam between received
 // network event notifications and the local event system. Uses the REAL bridge, the REAL
-// LocalPlayerController, a REAL Engine::EventManager on a fake clock and REAL GameObjects, so
+// ShipController, a REAL Engine::EventManager on a fake clock and REAL GameObjects, so
 // what is proven is the actual local-vs-remote Death separation Game runs. No SDL, no
 // sockets (the PeerClient transport itself is proven in PeerClientIntegrationTest).
 
-#include "LocalPlayerController.h"
+#include "ArenaRules.h"
+#include "BulletField.h"
+#include "ShipController.h"
 #include "PeerEventBridge.h"
 
 #include <cstdio>
@@ -31,29 +33,32 @@ namespace
 	constexpr Engine::PlayerId LocalNetworkId = 1;
 	constexpr Engine::PlayerId RemoteNetworkIdA = 7;
 	constexpr Engine::PlayerId RemoteNetworkIdB = 9;
-	constexpr Engine::Vector2 Spawn{ 80.0f, 900.0f };
+	constexpr Engine::Vector2 SpawnCentre{ 400.0f, 300.0f };
+	constexpr Engine::Vector2 ShipSize{ 48.0f, 48.0f };
 
-	// A local player (network id 1), two remote players (7 and 9), the client-local enemy and
-	// a death zone, all in one registry, with the real controller and bridge subscribed to the
-	// same EventManager exactly as Game wires them.
+	// A local ship (network id 1) and two remote players (7 and 9) in one registry, with the
+	// real controller and bridge subscribed to the same EventManager exactly as Game wires them.
 	struct Scene
 	{
 		Scene()
-			: Events([this] { return Now; })
+			: Events([this] { return Now; }),
+			  Physics(0.0f),
+			  Bullets(Objects, Physics, BulletConfig{ Astro::BulletSpeed, Astro::BulletLifetime, Astro::BulletRadius })
 		{
-			Engine::GameObject& player = Objects.Create(Engine::ObjectType::Player, { 100.0f, 100.0f }, { 50.0f, 50.0f });
-			player.SetVelocity({ 11.0f, 22.0f });
-			player.SetNetworkId(LocalNetworkId);
-			PlayerId = player.GetId();
+			Engine::GameObject& ship = Objects.Create(Engine::ObjectType::Player, { 0.0f, 0.0f }, ShipSize);
+			SetCenter(ship, SpawnCentre);
+			ship.SetVelocity({ 11.0f, 22.0f });
+			ship.SetNetworkId(LocalNetworkId);
+			PlayerId = ship.GetId();
 
 			RemoteAId = MakeRemote(RemoteNetworkIdA, 500.0f);
 			RemoteBId = MakeRemote(RemoteNetworkIdB, 900.0f);
-			EnemyId = Objects.Create(Engine::ObjectType::Generic, { 5000.0f, 0.0f }, { 50.0f, 50.0f }).GetId();
-			DeathZoneId = Objects.Create(Engine::ObjectType::DeathZone, { 0.0f, 1080.0f }, { 3840.0f, 1000000.0f }).GetId();
 
-			Controller = std::make_unique<LocalPlayerController>(
-			    Events, Objects, LocalPlayerObjects{ PlayerId, EnemyId, DeathZoneId },
-			    LocalPlayerConfig{ 300.0f, 650.0f, 1920.0f }, [] { return Spawn; });
+			Controller = std::make_unique<ShipController>(
+			    Events, Objects, Bullets, PlayerId,
+			    ShipConfig{ Astro::ShipSpeed, Astro::ShipRotationSpeed, Astro::ShipRadius, Astro::MuzzleDistance,
+			                Astro::FireCooldown, Astro::RespawnDelay, Astro::InvulnerabilityDuration },
+			    [] { return SpawnCentre; }, [this] { return Now; });
 			Bridge = std::make_unique<PeerEventBridge>(Events, Objects, PlayerId, [this] { return Now; },
 			                                          [this](Engine::NetworkEventKind kind) { SentToPeers.push_back(kind); });
 
@@ -65,27 +70,45 @@ namespace
 
 		Engine::ObjectId MakeRemote(Engine::PlayerId networkId, float x)
 		{
-			Engine::GameObject& remote = Objects.Create(Engine::ObjectType::Player, { x, 800.0f }, { 50.0f, 50.0f });
+			Engine::GameObject& remote = Objects.Create(Engine::ObjectType::Player, { x, 800.0f }, ShipSize);
 			remote.SetNetworkId(networkId);
 			return remote.GetId();
 		}
 
-		Engine::GameObject& Player() { return *Objects.Find(PlayerId); }
+		// Brings the local ship to life and lets its spawn invulnerability run out, then forgets
+		// the setup events so each test only sees what it provokes.
+		void MakeShipVulnerable()
+		{
+			Controller->RequestSpawn(SpawnCentre);
+			Events.DispatchDue();
+			Now += Astro::InvulnerabilityDuration + 0.5;
+			SeenSpawn.clear();
+		}
+
+		// A bullet nobody owns lands on the local ship through the real hit-detection path.
+		void ShootLocalShip()
+		{
+			Bullets.Fire(CenterOf(Ship()), 0.0f, Engine::NoObjectId);
+			Controller->BeginFrame();
+			Controller->DetectBulletHits();
+		}
+
+		Engine::GameObject& Ship() { return *Objects.Find(PlayerId); }
 
 		double Now = 0.0;
 		Engine::EventManager Events;
 		Engine::GameObjectRegistry Objects;
+		Engine::PhysicsSystem Physics;
+		BulletField Bullets;
 		Engine::ObjectId PlayerId = 0;
 		Engine::ObjectId RemoteAId = 0;
 		Engine::ObjectId RemoteBId = 0;
-		Engine::ObjectId EnemyId = 0;
-		Engine::ObjectId DeathZoneId = 0;
 
 		std::vector<Engine::NetworkEventKind> SentToPeers;
 		std::vector<Engine::Event> SeenDeath;
 		std::vector<Engine::Event> SeenSpawn;
 		std::vector<Engine::ScopedSubscription> Subscriptions;
-		std::unique_ptr<LocalPlayerController> Controller;
+		std::unique_ptr<ShipController> Controller;
 		std::unique_ptr<PeerEventBridge> Bridge;
 	};
 
@@ -112,15 +135,16 @@ int main()
 	// 2. A remote death never touches the local player, and is never echoed back out.
 	{
 		Scene scene;
-		scene.Controller->SetCameraOffsetX(1920.0f);
-		Engine::Vector2 positionBefore = scene.Player().GetPosition();
+		scene.MakeShipVulnerable();
+		Engine::Vector2 positionBefore = scene.Ship().GetPosition();
+		Engine::Vector2 velocityBefore = scene.Ship().GetVelocity();
 		scene.Bridge->HandleNetworkEvent(DeathOf(RemoteNetworkIdA));
 		scene.Events.DispatchDue();
-		Check(scene.SeenSpawn.empty(), "Remote_Death_RaisesNoSpawn");
-		Check(scene.Player().GetPosition().X == positionBefore.X && scene.Player().GetPosition().Y == positionBefore.Y &&
-		          scene.Player().GetVelocity().X == 11.0f && scene.Player().GetVelocity().Y == 22.0f &&
-		          scene.Controller->CameraOffsetX() == 1920.0f,
-		      "Remote_Death_DoesNotRespawnOrAlterTheLocalPlayer");
+		Check(scene.SeenSpawn.empty() && scene.Events.PendingCount() == 0, "Remote_Death_RaisesAndSchedulesNoSpawn");
+		Check(scene.Ship().GetPosition().X == positionBefore.X && scene.Ship().GetPosition().Y == positionBefore.Y &&
+		          scene.Ship().GetVelocity().X == velocityBefore.X && scene.Ship().GetVelocity().Y == velocityBefore.Y &&
+		          scene.Controller->IsAlive(),
+		      "Remote_Death_DoesNotKillOrMoveTheLocalShip");
 		Check(scene.SentToPeers.empty(), "Remote_Death_IsNotReBroadcast");
 	}
 
@@ -183,17 +207,19 @@ int main()
 		Check(!scene.Bridge->IsMarkedDead(scene.RemoteBId), "Ignored_PlayerRemovedBeforeDispatch_IsNotMarked");
 	}
 
-	// 6. A LOCAL death still runs Death -> Spawn normally, and is announced to peers exactly once.
+	// 6. A LOCAL death still runs Collision -> Death -> (delayed) Spawn, and is announced to peers once.
 	{
 		Scene scene;
-		scene.Player().SetPosition({ 100.0f, 1100.0f });
-		scene.Controller->BeginFrame();
-		scene.Controller->DetectHazardCollisions();
+		scene.MakeShipVulnerable();
+		scene.ShootLocalShip();
 		scene.Events.DispatchDue();
-		Check(scene.SeenDeath.size() == 1 && scene.SeenSpawn.size() == 1, "Local_Death_StillProducesExactlyOneDeathAndOneSpawn");
-		Check(scene.Player().GetPosition().X == Spawn.X && scene.Player().GetPosition().Y == Spawn.Y &&
-		          scene.Player().GetVelocity().X == 0.0f && scene.Player().GetVelocity().Y == 0.0f,
-		      "Local_Death_StillRespawnsThePlayer");
+		Check(scene.SeenDeath.size() == 1 && !scene.Controller->IsAlive(),
+		      "Local_Death_StillProducesExactlyOneDeath");
+		Check(scene.SeenSpawn.empty() && scene.Events.PendingCount() == 1,
+		      "Local_Death_SpawnIsScheduledNotImmediate");
+		scene.Now += Astro::RespawnDelay;
+		scene.Events.DispatchDue();
+		Check(scene.SeenSpawn.size() == 1 && scene.Controller->IsAlive(), "Local_Death_StillRespawnsTheShipAfterTheDelay");
 		Check(scene.SentToPeers.size() == 1 && scene.SentToPeers[0] == Engine::NetworkEventKind::Death,
 		      "Local_Death_IsAnnouncedToPeersExactlyOnce");
 		Check(!scene.Bridge->IsMarkedDead(scene.PlayerId) && !scene.Bridge->IsMarkedDead(scene.RemoteAId),
@@ -203,21 +229,22 @@ int main()
 	// Local and remote deaths in the same dispatch each take their own path.
 	{
 		Scene scene;
-		scene.Player().SetPosition({ 100.0f, 1100.0f });
-		scene.Controller->BeginFrame();
-		scene.Controller->DetectHazardCollisions();
+		scene.MakeShipVulnerable();
+		scene.ShootLocalShip();
 		scene.Bridge->HandleNetworkEvent(DeathOf(RemoteNetworkIdB));
 		scene.Events.DispatchDue();
-		Check(scene.SeenSpawn.size() == 1 && scene.SentToPeers.size() == 1 && scene.Bridge->IsMarkedDead(scene.RemoteBId),
+		Check(!scene.Controller->IsAlive() && scene.SentToPeers.size() == 1 && scene.Bridge->IsMarkedDead(scene.RemoteBId),
 		      "Mixed_LocalAndRemoteDeathInOneDispatch_EachHandledSeparately");
 	}
 
-	// A Death about a non-networked object (the enemy) is neither marked nor announced.
+	// A Death about a non-networked object (a bullet) is neither marked nor announced.
 	{
 		Scene scene;
-		scene.Events.Raise(Engine::DeathEventData{ scene.EnemyId, Engine::NoObjectId });
+		scene.MakeShipVulnerable();
+		Engine::ObjectId bullet = scene.Bullets.Fire({ 900.0f, 900.0f }, 0.0f, Engine::NoObjectId);
+		scene.Events.Raise(Engine::DeathEventData{ bullet, Engine::NoObjectId });
 		scene.Events.DispatchDue();
-		Check(!scene.Bridge->IsMarkedDead(scene.EnemyId) && scene.SentToPeers.empty() && scene.SeenSpawn.empty(),
+		Check(!scene.Bridge->IsMarkedDead(bullet) && scene.SentToPeers.empty() && scene.Controller->IsAlive(),
 		      "NonNetworkedDeath_IsNeitherMarkedNorAnnounced");
 	}
 
